@@ -26,6 +26,7 @@
 /*.lo
 /*.la
 /*.o
+/*.dep
 /.deps/
 /.libs/
 /tmp-php.ini
