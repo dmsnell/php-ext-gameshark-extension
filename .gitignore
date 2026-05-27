@@ -23,6 +23,7 @@
 /missing
 /modules/
 /run-tests.php
+/rust/target/
 /*.lo
 /*.la
 /*.o
