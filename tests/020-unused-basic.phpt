@@ -81,10 +81,10 @@ $functions = array_column($report['uncalled_functions'], 'display_name');
 $methods = array_column($report['uncalled_concrete_methods'], 'display_name');
 $classes = array_column($report['classes_with_no_new_opcode_observed'], 'display_name');
 $globals = [];
-foreach ($report['global_constants_without_read_observed'] as $row) {
+foreach ($report['global_constants_without_value_access_observed'] as $row) {
     $globals[$row['display_name']] = $row;
 }
-$classConstants = array_column($report['class_constants_without_read_observed'], 'display_name');
+$classConstants = array_column($report['class_constants_without_value_access_observed'], 'display_name');
 
 sort($functions);
 sort($methods);

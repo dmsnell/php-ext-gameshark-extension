@@ -190,6 +190,7 @@ static uint64_t gameshark_invariant_internal_post_invocations = 0;
 static uint64_t gameshark_invariant_internal_original_exceptions = 0;
 static uint64_t gameshark_invariant_internal_hook_exceptions = 0;
 static bool gameshark_execute_internal_previous_present = false;
+static zend_op_array *(*gameshark_original_compile_file)(zend_file_handle *file_handle, int type) = NULL;
 static void (*gameshark_original_execute_ex)(zend_execute_data *execute_data) = NULL;
 static void (*gameshark_original_execute_internal)(zend_execute_data *execute_data, zval *return_value) = NULL;
 static bool gameshark_new_opcode_handler_owned = false;
@@ -201,6 +202,7 @@ static bool gameshark_numeric_matches_long(zend_long value);
 static bool gameshark_numeric_matches_double(double value);
 static bool gameshark_string_has_nul(zend_string *string);
 static zend_string *gameshark_scalar_value(zval *value);
+static bool gameshark_is_absolute_path(const char *path);
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_gameshark_loaded, 0, 0, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
@@ -395,6 +397,20 @@ static void gameshark_unused_record_caveat(const char *caveat)
 	if (gameshark_unused_active && caveat != NULL) {
 		gameshark_core_record_unused_caveat(caveat);
 	}
+}
+
+static void gameshark_unused_record_included_file(zend_string *file)
+{
+	if (!gameshark_unused_active || file == NULL || ZSTR_LEN(file) == 0) {
+		return;
+	}
+	if (!gameshark_is_absolute_path(ZSTR_VAL(file))) {
+		return;
+	}
+	if (gameshark_unused_file_is_invariant(file)) {
+		return;
+	}
+	gameshark_core_record_unused_included_file(ZSTR_VAL(file));
 }
 
 static void gameshark_unused_record_call(gameshark_core_function_meta *meta)
@@ -3071,6 +3087,28 @@ static void gameshark_execute_internal(zend_execute_data *execute_data, zval *re
 	zend_string_release(match_key);
 }
 
+static zend_op_array *gameshark_compile_file(zend_file_handle *file_handle, int type)
+{
+	zend_op_array *op_array = NULL;
+	if (gameshark_original_compile_file != NULL) {
+		op_array = gameshark_original_compile_file(file_handle, type);
+	} else {
+		op_array = compile_file(file_handle, type);
+	}
+
+	if (op_array != NULL && gameshark_unused_active && (file_handle == NULL || !file_handle->primary_script)) {
+		if (op_array->filename != NULL) {
+			gameshark_unused_record_included_file(op_array->filename);
+		} else if (file_handle != NULL && file_handle->opened_path != NULL) {
+			gameshark_unused_record_included_file(file_handle->opened_path);
+		} else if (file_handle != NULL && file_handle->filename != NULL) {
+			gameshark_unused_record_included_file(file_handle->filename);
+		}
+	}
+
+	return op_array;
+}
+
 PHP_MINIT_FUNCTION(gameshark)
 {
 	if (type != MODULE_TEMPORARY) {
@@ -3099,12 +3137,18 @@ PHP_MINIT_FUNCTION(gameshark)
 	gameshark_original_execute_internal = zend_execute_internal;
 	gameshark_execute_internal_previous_present = gameshark_original_execute_internal != NULL;
 	zend_execute_internal = gameshark_execute_internal;
+	gameshark_original_compile_file = zend_compile_file;
+	zend_compile_file = gameshark_compile_file;
 	REGISTER_INI_ENTRIES();
 	return SUCCESS;
 }
 
 PHP_MSHUTDOWN_FUNCTION(gameshark)
 {
+	if (zend_compile_file == gameshark_compile_file && gameshark_original_compile_file != NULL) {
+		zend_compile_file = gameshark_original_compile_file;
+	}
+	gameshark_original_compile_file = NULL;
 	if (gameshark_new_opcode_handler_owned && zend_get_user_opcode_handler(ZEND_NEW) == gameshark_unused_new_opcode_handler) {
 		zend_set_user_opcode_handler(ZEND_NEW, NULL);
 	}

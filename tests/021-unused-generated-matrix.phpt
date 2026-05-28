@@ -106,6 +106,7 @@ class MatrixConstClass {
 }
 define('MATRIX_HIT_CONST', 'hit');
 define('MATRIX_PROBED_CONST', 'probed');
+define('MATRIX_DIRECT_CONST', 'direct');
 $classFile = sys_get_temp_dir() . '/gameshark_matrix_direct_const_' . getmypid() . '.php';
 file_put_contents($classFile, <<<'PHP_FILE'
 <?php
@@ -118,38 +119,34 @@ require $classFile;
 @unlink($classFile);
 constant('MatrixConstClass::HIT');
 constant('MATRIX_HIT_CONST');
+$directGlobal = MATRIX_DIRECT_CONST;
 defined('MATRIX_PROBED_CONST');
 defined('MatrixConstClass::MISS');
-try {
-    $late = MATRIX_LATE_CONST;
-} catch (Throwable $e) {
-}
-define('MATRIX_LATE_CONST', 'late');
 defined('MATRIX_LATE_PROBED_CONST');
 define('MATRIX_LATE_PROBED_CONST', 'late-probed');
 $directHit = MatrixDirectConstClass::HIT;
 PHP);
 
-$globalProbe = row_by_name($constants['global_constants_without_read_observed'], 'MATRIX_PROBED_CONST');
-$lateFetch = row_by_name($constants['global_constants_without_read_observed'], 'MATRIX_LATE_CONST');
-$lateProbe = row_by_name($constants['global_constants_without_read_observed'], 'MATRIX_LATE_PROBED_CONST');
-$classProbe = row_by_name($constants['class_constants_without_read_observed'], 'MatrixConstClass::MISS');
-$directHit = row_by_name($constants['class_constants_without_read_observed'], 'MatrixDirectConstClass::HIT');
-$classConstants = names($constants['class_constants_without_read_observed']);
+$globalProbe = row_by_name($constants['global_constants_without_value_access_observed'], 'MATRIX_PROBED_CONST');
+$lateProbe = row_by_name($constants['global_constants_without_value_access_observed'], 'MATRIX_LATE_PROBED_CONST');
+$classProbe = row_by_name($constants['class_constants_without_value_access_observed'], 'MatrixConstClass::MISS');
+$directHit = row_by_name($constants['class_constants_without_value_access_observed'], 'MatrixDirectConstClass::HIT');
+$classConstants = names($constants['class_constants_without_value_access_observed']);
 var_dump($globalProbe !== null);
 var_dump($globalProbe['defined_probe_count'] === 1);
-var_dump(row_by_name($constants['global_constants_without_read_observed'], 'MATRIX_HIT_CONST') === null);
-var_dump($lateFetch !== null);
-var_dump($lateFetch['fetch_observed_count'] === 1);
-var_dump($lateFetch['read_observed_count'] === 0);
+var_dump(row_by_name($constants['global_constants_without_value_access_observed'], 'MATRIX_HIT_CONST') === null);
+var_dump(row_by_name($constants['global_constants_without_value_access_observed'], 'MATRIX_DIRECT_CONST') === null);
 var_dump($lateProbe !== null);
 var_dump($lateProbe['defined_probe_count'] === 1);
 var_dump($classProbe !== null);
 var_dump($classProbe['defined_probe_count'] === 1);
 var_dump(!in_array('MatrixConstClass::HIT', $classConstants, true));
 var_dump(in_array('MatrixDirectConstClass::MISS', $classConstants, true));
-var_dump($directHit !== null);
-var_dump($directHit['fetch_observed_count'] === 1);
+var_dump($directHit === null);
+var_dump(names($constants['global_constants_without_read_observed']) === names($constants['global_constants_without_value_access_observed']));
+var_dump(names($constants['class_constants_without_read_observed']) === names($constants['class_constants_without_value_access_observed']));
+var_dump($constants['summary']['global_constant_without_read_count'] === $constants['summary']['global_constant_without_value_access_count']);
+var_dump($constants['summary']['class_constant_without_read_count'] === $constants['summary']['class_constant_without_value_access_count']);
 
 $constructs = run_unused_matrix('constructs', <<<'PHP'
 abstract class MatrixAbstractBase {
@@ -190,6 +187,7 @@ foreach (glob(__DIR__ . '/gameshark_unused_matrix_*.sqlite*') as $file) {
 }
 ?>
 --EXPECT--
+bool(true)
 bool(true)
 bool(true)
 bool(true)

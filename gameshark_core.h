@@ -84,6 +84,7 @@ void gameshark_core_record_trace_event(const gameshark_core_trace_event *event);
 void gameshark_core_record_transformed_value(const gameshark_core_transformed_value *value);
 void gameshark_core_record_unused_declaration(const gameshark_core_unused_declaration *declaration);
 void gameshark_core_record_unused_access(const gameshark_core_unused_access *access);
+void gameshark_core_record_unused_included_file(const char *file);
 void gameshark_core_record_unused_caveat(const char *caveat);
 void gameshark_core_request_finish(void);
 char *gameshark_core_compare_json(const char *db_path);

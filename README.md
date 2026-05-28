@@ -79,18 +79,26 @@ Unused runtime coverage mode:
 GAMESHARK_DB=/tmp/unused.sqlite GAMESHARK_UNUSED=1 php -d extension=gameshark.so script.php
 GAMESHARK_DB=/tmp/unused.sqlite php -d extension=gameshark.so -r 'echo gameshark_unused_report();'
 GAMESHARK_DB=/tmp/unused.sqlite php -d extension=gameshark.so -r 'echo gameshark_unused_report("json");'
+php -d memory_limit=-1 ../scripts/wp-unused-aggregate-report.php /tmp/unused.sqlite text
 ```
 
-The unused report lists userland functions, concrete methods, classes, global
-constants, and class constants that were declared during the run but had no
-matching runtime access observed. This is request loaded-code coverage, not
-proof of dead code. The default report selects the latest completed unused run;
-pass a run id as the second argument to inspect an earlier run. Human text
-output shows the first 50 rows per section, while JSON and array output are
-complete. Opcode observations for dynamic names and optimizer-folded constants
-are best effort. Direct constant fetches and `defined()` checks are recorded as
-pre-dispatch observations, but only successful `constant()` reads count as
-constant reads.
+The unused report lists userland functions, concrete methods, classes, constants,
+and included files that were loaded during the run but had no matching runtime
+access observed. This is request loaded-code coverage, not proof of dead code.
+The default report selects the latest completed unused run; pass a run id as the
+second argument to inspect an earlier run.
+
+For web traffic sampling, reuse the same SQLite database across many
+instrumented requests and use the aggregate helper to merge completed runs into
+one probabilistic coverage profile. The aggregate text and JSON reports are
+complete; use `GAMESHARK_COLOR=always` with the aggregate text command when
+writing ANSI output for `less -R`.
+
+Direct constant syntax and `constant('NAME')` count as value access;
+`defined()` checks are recorded as probes only. Included-file sections
+distinguish files with declarations that were never accessed from files with no
+declarations at all. Opcode-derived constant observations are best effort and
+should be treated as runtime coverage signals, not exact value-flow proof.
 
 Trace limiting can be applied with a Rust regex over canonical function names:
 

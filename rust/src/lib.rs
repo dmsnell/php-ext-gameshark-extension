@@ -241,6 +241,11 @@ struct UnusedAccess {
     count: u64,
 }
 
+struct UnusedIncludedFile {
+    file: String,
+    include_count: u64,
+}
+
 struct State {
     db_path: String,
     side: Option<String>,
@@ -259,6 +264,7 @@ struct State {
     unused_run_id: Option<i64>,
     unused_declarations: HashMap<UnusedSymbolKey, UnusedDeclaration>,
     unused_accesses: HashMap<(UnusedSymbolKey, UnusedAccessKind), UnusedAccess>,
+    unused_included_files: HashMap<String, u64>,
     unused_caveats: HashSet<String>,
 }
 
@@ -432,8 +438,12 @@ struct UnusedReport {
     uncalled_functions: Vec<UnusedReportRow>,
     uncalled_concrete_methods: Vec<UnusedReportRow>,
     classes_with_no_new_opcode_observed: Vec<UnusedReportRow>,
+    global_constants_without_value_access_observed: Vec<UnusedReportRow>,
+    class_constants_without_value_access_observed: Vec<UnusedReportRow>,
     global_constants_without_read_observed: Vec<UnusedReportRow>,
     class_constants_without_read_observed: Vec<UnusedReportRow>,
+    included_files_with_no_accessed_declarations: Vec<UnusedIncludedFileReport>,
+    included_files_without_declarations: Vec<UnusedIncludedFileReport>,
 }
 
 #[derive(Serialize)]
@@ -445,8 +455,13 @@ struct UnusedSummary {
     uncalled_function_count: usize,
     uncalled_concrete_method_count: usize,
     class_without_new_count: usize,
+    global_constant_without_value_access_count: usize,
+    class_constant_without_value_access_count: usize,
     global_constant_without_read_count: usize,
     class_constant_without_read_count: usize,
+    included_file_count: usize,
+    included_file_with_no_accessed_declaration_count: usize,
+    included_file_without_declaration_count: usize,
 }
 
 #[derive(Serialize)]
@@ -468,7 +483,7 @@ struct UnusedRunReport {
     caveats: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct UnusedReportRow {
     kind: String,
     display_name: String,
@@ -484,6 +499,19 @@ struct UnusedReportRow {
     read_observed_count: u64,
     defined_probe_count: u64,
     file_had_any_access: Option<bool>,
+}
+
+#[derive(Clone, Serialize)]
+struct UnusedIncludedFileReport {
+    file: String,
+    include_count: u64,
+    declaration_count: usize,
+    accessed_declaration_count: usize,
+    function_declaration_count: usize,
+    method_declaration_count: usize,
+    class_declaration_count: usize,
+    global_constant_declaration_count: usize,
+    class_constant_declaration_count: usize,
 }
 
 static STATE: LazyLock<Mutex<Option<State>>> = LazyLock::new(|| Mutex::new(None));
@@ -629,6 +657,7 @@ pub extern "C" fn gameshark_core_request_start(
         unused_run_id,
         unused_declarations: HashMap::new(),
         unused_accesses: HashMap::new(),
+        unused_included_files: HashMap::new(),
         unused_caveats,
     });
     1
@@ -901,6 +930,27 @@ pub unsafe extern "C" fn gameshark_core_record_unused_access(
 }
 
 #[no_mangle]
+pub extern "C" fn gameshark_core_record_unused_included_file(file: *const c_char) {
+    let Some(file) = c_string(file).filter(|value| !value.is_empty()) else {
+        return;
+    };
+
+    let mut state = STATE.lock().expect("gameshark state lock poisoned");
+    let Some(state) = state.as_mut() else {
+        return;
+    };
+    if state.unused_run_id.is_none() {
+        return;
+    }
+
+    state
+        .unused_included_files
+        .entry(file)
+        .and_modify(|count| *count += 1)
+        .or_insert(1);
+}
+
+#[no_mangle]
 pub extern "C" fn gameshark_core_record_unused_caveat(caveat: *const c_char) {
     let Some(caveat) = c_string(caveat).filter(|value| !value.is_empty()) else {
         return;
@@ -997,15 +1047,24 @@ pub extern "C" fn gameshark_core_unused_report_json(
                     "uncalled_function_count": 0,
                     "uncalled_concrete_method_count": 0,
                     "class_without_new_count": 0,
+                    "global_constant_without_value_access_count": 0,
+                    "class_constant_without_value_access_count": 0,
                     "global_constant_without_read_count": 0,
-                    "class_constant_without_read_count": 0
+                    "class_constant_without_read_count": 0,
+                    "included_file_count": 0,
+                    "included_file_with_no_accessed_declaration_count": 0,
+                    "included_file_without_declaration_count": 0
                 },
                 "run": null,
                 "uncalled_functions": [],
                 "uncalled_concrete_methods": [],
                 "classes_with_no_new_opcode_observed": [],
+                "global_constants_without_value_access_observed": [],
+                "class_constants_without_value_access_observed": [],
                 "global_constants_without_read_observed": [],
-                "class_constants_without_read_observed": []
+                "class_constants_without_read_observed": [],
+                "included_files_with_no_accessed_declarations": [],
+                "included_files_without_declarations": []
             })
         },
     )
@@ -1285,6 +1344,13 @@ fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 end_line INTEGER,
                 access_count INTEGER NOT NULL,
                 PRIMARY KEY (run_id, identity_hash, access_kind),
+                FOREIGN KEY (run_id) REFERENCES unused_runs(run_id)
+            );
+            CREATE TABLE IF NOT EXISTS unused_included_files (
+                run_id INTEGER NOT NULL,
+                file TEXT NOT NULL,
+                include_count INTEGER NOT NULL,
+                PRIMARY KEY (run_id, file),
                 FOREIGN KEY (run_id) REFERENCES unused_runs(run_id)
             );
             ",
@@ -1648,6 +1714,7 @@ fn flush_state(state: State) -> Result<(), String> {
     if let Some(run_id) = state.unused_run_id {
         flush_unused_declarations(&transaction, run_id, &state.unused_declarations)?;
         flush_unused_accesses(&transaction, run_id, &state.unused_accesses)?;
+        flush_unused_included_files(&transaction, run_id, &state.unused_included_files)?;
         let mut caveats: Vec<_> = state.unused_caveats.into_iter().collect();
         caveats.sort();
         let caveats_json = serde_json::to_string(&caveats).map_err(|error| error.to_string())?;
@@ -1814,6 +1881,27 @@ fn flush_unused_declarations(
                     declaration.end_line,
                     declaration.flags
                 ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn flush_unused_included_files(
+    transaction: &Transaction<'_>,
+    run_id: i64,
+    included_files: &HashMap<String, u64>,
+) -> Result<(), String> {
+    for (file, include_count) in included_files {
+        transaction
+            .execute(
+                "
+                INSERT INTO unused_included_files (run_id, file, include_count)
+                VALUES (?, ?, ?)
+                ON CONFLICT(run_id, file) DO UPDATE SET
+                    include_count = excluded.include_count
+                ",
+                params![run_id, file, include_count],
             )
             .map_err(|error| error.to_string())?;
     }
@@ -2101,6 +2189,7 @@ fn unused_report(db_path: &str, requested_run_id: i64) -> Result<UnusedReport, S
     let run = unused_run_for_id(&connection, run_id)?;
     let declarations = unused_declarations_for_run(&connection, run_id)?;
     let accesses = unused_accesses_for_run(&connection, run_id)?;
+    let included_files = unused_included_files_for_run(&connection, run_id)?;
     let mut declaration_by_key = HashMap::new();
     let mut class_flags_by_name = HashMap::new();
     for declaration in &declarations {
@@ -2130,8 +2219,8 @@ fn unused_report(db_path: &str, requested_run_id: i64) -> Result<UnusedReport, S
     let mut uncalled_functions = Vec::new();
     let mut uncalled_concrete_methods = Vec::new();
     let mut classes_with_no_new_opcode_observed = Vec::new();
-    let mut global_constants_without_read_observed = Vec::new();
-    let mut class_constants_without_read_observed = Vec::new();
+    let mut global_constants_without_value_access_observed = Vec::new();
+    let mut class_constants_without_value_access_observed = Vec::new();
 
     for declaration in &declarations {
         match declaration.key.kind {
@@ -2184,13 +2273,8 @@ fn unused_report(db_path: &str, requested_run_id: i64) -> Result<UnusedReport, S
                 }
             }
             UnusedSymbolKind::GlobalConstant => {
-                let read_count = access_count(
-                    &access_counts,
-                    &declaration.key,
-                    UnusedAccessKind::GlobalConstantRead,
-                );
-                if read_count == 0 {
-                    global_constants_without_read_observed.push(unused_row(
+                if constant_value_access_count(&access_counts, &declaration.key) == 0 {
+                    global_constants_without_value_access_observed.push(unused_row(
                         declaration,
                         &access_counts,
                         &active_files,
@@ -2198,13 +2282,8 @@ fn unused_report(db_path: &str, requested_run_id: i64) -> Result<UnusedReport, S
                 }
             }
             UnusedSymbolKind::ClassConstant => {
-                let read_count = access_count(
-                    &access_counts,
-                    &declaration.key,
-                    UnusedAccessKind::ClassConstantRead,
-                );
-                if read_count == 0 {
-                    class_constants_without_read_observed.push(unused_row(
+                if constant_value_access_count(&access_counts, &declaration.key) == 0 {
+                    class_constants_without_value_access_observed.push(unused_row(
                         declaration,
                         &access_counts,
                         &active_files,
@@ -2218,8 +2297,15 @@ fn unused_report(db_path: &str, requested_run_id: i64) -> Result<UnusedReport, S
     sort_unused_rows(&mut uncalled_functions);
     sort_unused_rows(&mut uncalled_concrete_methods);
     sort_unused_rows(&mut classes_with_no_new_opcode_observed);
-    sort_unused_rows(&mut global_constants_without_read_observed);
-    sort_unused_rows(&mut class_constants_without_read_observed);
+    sort_unused_rows(&mut global_constants_without_value_access_observed);
+    sort_unused_rows(&mut class_constants_without_value_access_observed);
+
+    let (included_files_with_no_accessed_declarations, included_files_without_declarations) =
+        included_file_reports(&included_files, &declarations, &access_counts);
+    let global_constants_without_read_observed =
+        global_constants_without_value_access_observed.clone();
+    let class_constants_without_read_observed =
+        class_constants_without_value_access_observed.clone();
 
     Ok(UnusedReport {
         summary: UnusedSummary {
@@ -2230,15 +2316,27 @@ fn unused_report(db_path: &str, requested_run_id: i64) -> Result<UnusedReport, S
             uncalled_function_count: uncalled_functions.len(),
             uncalled_concrete_method_count: uncalled_concrete_methods.len(),
             class_without_new_count: classes_with_no_new_opcode_observed.len(),
+            global_constant_without_value_access_count:
+                global_constants_without_value_access_observed.len(),
+            class_constant_without_value_access_count:
+                class_constants_without_value_access_observed.len(),
             global_constant_without_read_count: global_constants_without_read_observed.len(),
             class_constant_without_read_count: class_constants_without_read_observed.len(),
+            included_file_count: included_files.len(),
+            included_file_with_no_accessed_declaration_count:
+                included_files_with_no_accessed_declarations.len(),
+            included_file_without_declaration_count: included_files_without_declarations.len(),
         },
         run: Some(run),
         uncalled_functions,
         uncalled_concrete_methods,
         classes_with_no_new_opcode_observed,
+        global_constants_without_value_access_observed,
+        class_constants_without_value_access_observed,
         global_constants_without_read_observed,
         class_constants_without_read_observed,
+        included_files_with_no_accessed_declarations,
+        included_files_without_declarations,
     })
 }
 
@@ -2421,6 +2519,35 @@ fn unused_accesses_for_run(
     Ok(accesses)
 }
 
+fn unused_included_files_for_run(
+    connection: &Connection,
+    run_id: i64,
+) -> Result<Vec<UnusedIncludedFile>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT file, include_count
+            FROM unused_included_files
+            WHERE run_id = ?
+            ORDER BY file
+            ",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![run_id], |row| {
+            Ok(UnusedIncludedFile {
+                file: row.get(0)?,
+                include_count: row.get(1)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    let mut included_files = Vec::new();
+    for row in rows {
+        included_files.push(row.map_err(|error| error.to_string())?);
+    }
+    Ok(included_files)
+}
+
 fn unused_symbol_kind_from_str(value: &str) -> Option<UnusedSymbolKind> {
     match value {
         "function" => Some(UnusedSymbolKind::Function),
@@ -2458,6 +2585,116 @@ fn access_count(
         .get(&(key.clone(), access_kind))
         .copied()
         .unwrap_or(0)
+}
+
+fn constant_value_access_count(
+    access_counts: &HashMap<(UnusedSymbolKey, UnusedAccessKind), u64>,
+    key: &UnusedSymbolKey,
+) -> u64 {
+    match key.kind {
+        UnusedSymbolKind::GlobalConstant => {
+            access_count(
+                access_counts,
+                key,
+                UnusedAccessKind::GlobalConstantFetchObserved,
+            ) + access_count(access_counts, key, UnusedAccessKind::GlobalConstantRead)
+        }
+        UnusedSymbolKind::ClassConstant => {
+            access_count(
+                access_counts,
+                key,
+                UnusedAccessKind::ClassConstantFetchObserved,
+            ) + access_count(access_counts, key, UnusedAccessKind::ClassConstantRead)
+        }
+        _ => 0,
+    }
+}
+
+fn declaration_access_count(
+    access_counts: &HashMap<(UnusedSymbolKey, UnusedAccessKind), u64>,
+    declaration: &UnusedDeclaration,
+) -> u64 {
+    match declaration.key.kind {
+        UnusedSymbolKind::Function => access_count(
+            access_counts,
+            &declaration.key,
+            UnusedAccessKind::FunctionCall,
+        ),
+        UnusedSymbolKind::Method => access_count(
+            access_counts,
+            &declaration.key,
+            UnusedAccessKind::MethodCall,
+        ),
+        UnusedSymbolKind::Class => access_count(
+            access_counts,
+            &declaration.key,
+            UnusedAccessKind::NewOpcodeObserved,
+        ),
+        UnusedSymbolKind::GlobalConstant | UnusedSymbolKind::ClassConstant => {
+            constant_value_access_count(access_counts, &declaration.key)
+        }
+        UnusedSymbolKind::Closure => 0,
+    }
+}
+
+fn included_file_reports(
+    included_files: &[UnusedIncludedFile],
+    declarations: &[UnusedDeclaration],
+    access_counts: &HashMap<(UnusedSymbolKey, UnusedAccessKind), u64>,
+) -> (Vec<UnusedIncludedFileReport>, Vec<UnusedIncludedFileReport>) {
+    let mut declarations_by_file: HashMap<&str, Vec<&UnusedDeclaration>> = HashMap::new();
+    for declaration in declarations {
+        if let Some(file) = declaration.file.as_deref() {
+            declarations_by_file
+                .entry(file)
+                .or_default()
+                .push(declaration);
+        }
+    }
+
+    let mut no_accessed_declarations = Vec::new();
+    let mut without_declarations = Vec::new();
+    for included_file in included_files {
+        let file_declarations = declarations_by_file
+            .get(included_file.file.as_str())
+            .map(|items| items.as_slice())
+            .unwrap_or(&[]);
+        let mut report = UnusedIncludedFileReport {
+            file: included_file.file.clone(),
+            include_count: included_file.include_count,
+            declaration_count: file_declarations.len(),
+            accessed_declaration_count: 0,
+            function_declaration_count: 0,
+            method_declaration_count: 0,
+            class_declaration_count: 0,
+            global_constant_declaration_count: 0,
+            class_constant_declaration_count: 0,
+        };
+
+        for declaration in file_declarations {
+            match declaration.key.kind {
+                UnusedSymbolKind::Function => report.function_declaration_count += 1,
+                UnusedSymbolKind::Method => report.method_declaration_count += 1,
+                UnusedSymbolKind::Class => report.class_declaration_count += 1,
+                UnusedSymbolKind::GlobalConstant => report.global_constant_declaration_count += 1,
+                UnusedSymbolKind::ClassConstant => report.class_constant_declaration_count += 1,
+                UnusedSymbolKind::Closure => {}
+            }
+            if declaration_access_count(access_counts, declaration) > 0 {
+                report.accessed_declaration_count += 1;
+            }
+        }
+
+        if report.declaration_count == 0 {
+            without_declarations.push(report);
+        } else if report.accessed_declaration_count == 0 {
+            no_accessed_declarations.push(report);
+        }
+    }
+
+    sort_included_file_rows(&mut no_accessed_declarations);
+    sort_included_file_rows(&mut without_declarations);
+    (no_accessed_declarations, without_declarations)
 }
 
 fn unused_row(
@@ -2530,6 +2767,10 @@ fn sort_unused_rows(rows: &mut [UnusedReportRow]) {
             .then_with(|| left.file.cmp(&right.file))
             .then_with(|| left.start_line.cmp(&right.start_line))
     });
+}
+
+fn sort_included_file_rows(rows: &mut [UnusedIncludedFileReport]) {
+    rows.sort_by(|left, right| left.file.cmp(&right.file));
 }
 
 fn transformed_values_for_run(
@@ -2860,12 +3101,13 @@ fn render_unused_text(report: &UnusedReport, color: bool) -> String {
     );
     let _ = writeln!(
         out,
-        "uncalled functions: {} | uncalled concrete methods: {} | classes without new: {} | unread constants: {}/{}",
+        "uncalled functions: {} | uncalled concrete methods: {} | classes without new: {} | constants without value access: {}/{} | included files: {}",
         report.summary.uncalled_function_count,
         report.summary.uncalled_concrete_method_count,
         report.summary.class_without_new_count,
-        report.summary.global_constant_without_read_count,
-        report.summary.class_constant_without_read_count
+        report.summary.global_constant_without_value_access_count,
+        report.summary.class_constant_without_value_access_count,
+        report.summary.included_file_count
     );
     let _ = writeln!(
         out,
@@ -2918,14 +3160,26 @@ fn render_unused_text(report: &UnusedReport, color: bool) -> String {
     );
     render_unused_section(
         &mut out,
-        "Global constants without read observed",
-        &report.global_constants_without_read_observed,
+        "Global constants without value access observed",
+        &report.global_constants_without_value_access_observed,
         color,
     );
     render_unused_section(
         &mut out,
-        "Class constants without read observed",
-        &report.class_constants_without_read_observed,
+        "Class constants without value access observed",
+        &report.class_constants_without_value_access_observed,
+        color,
+    );
+    render_included_file_section(
+        &mut out,
+        "Included files with no accessed declarations",
+        &report.included_files_with_no_accessed_declarations,
+        color,
+    );
+    render_included_file_section(
+        &mut out,
+        "Included files without declarations",
+        &report.included_files_without_declarations,
         color,
     );
 
@@ -2963,6 +3217,44 @@ fn render_unused_section(out: &mut String, title: &str, rows: &[UnusedReportRow]
             row.read_observed_count,
             row.defined_probe_count,
             peer
+        );
+    }
+    if rows.len() > shown {
+        let _ = writeln!(out, "  ... {} more", rows.len() - shown);
+    }
+}
+
+fn render_included_file_section(
+    out: &mut String,
+    title: &str,
+    rows: &[UnusedIncludedFileReport],
+    color: bool,
+) {
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{}",
+        ansi(color, "36", &format!("{title} ({})", rows.len()))
+    );
+    if rows.is_empty() {
+        let _ = writeln!(out, "  none");
+        return;
+    }
+
+    let shown = rows.len().min(50);
+    for row in rows.iter().take(shown) {
+        let _ = writeln!(
+            out,
+            "  {} includes={} declarations={} accessed={} functions={} methods={} classes={} constants={}/{}",
+            ansi(color, "35", &row.file),
+            row.include_count,
+            row.declaration_count,
+            row.accessed_declaration_count,
+            row.function_declaration_count,
+            row.method_declaration_count,
+            row.class_declaration_count,
+            row.global_constant_declaration_count,
+            row.class_constant_declaration_count
         );
     }
     if rows.len() > shown {
