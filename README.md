@@ -6,7 +6,7 @@ SQLite-backed report storage to a Rust static library.
 
 ## Supported build targets
 
-- PHP 8.0 or newer.
+- PHP 8.2 or newer.
 - Linux and macOS.
 - Non-ZTS PHP builds.
 - Rust toolchain with `cargo`.
@@ -73,6 +73,25 @@ GAMESHARK_DB=/tmp/trace.sqlite GAMESHARK_TRACE_VALUE=needle php -d extension=gam
 GAMESHARK_DB=/tmp/trace.sqlite php -d extension=gameshark.so -r 'echo gameshark_trace_report("json");'
 ```
 
+Unused runtime coverage mode:
+
+```sh
+GAMESHARK_DB=/tmp/unused.sqlite GAMESHARK_UNUSED=1 php -d extension=gameshark.so script.php
+GAMESHARK_DB=/tmp/unused.sqlite php -d extension=gameshark.so -r 'echo gameshark_unused_report();'
+GAMESHARK_DB=/tmp/unused.sqlite php -d extension=gameshark.so -r 'echo gameshark_unused_report("json");'
+```
+
+The unused report lists userland functions, concrete methods, classes, global
+constants, and class constants that were declared during the run but had no
+matching runtime access observed. This is request loaded-code coverage, not
+proof of dead code. The default report selects the latest completed unused run;
+pass a run id as the second argument to inspect an earlier run. Human text
+output shows the first 50 rows per section, while JSON and array output are
+complete. Opcode observations for dynamic names and optimizer-folded constants
+are best effort. Direct constant fetches and `defined()` checks are recorded as
+pre-dispatch observations, but only successful `constant()` reads count as
+constant reads.
+
 Trace limiting can be applied with a Rust regex over canonical function names:
 
 ```sh
@@ -87,4 +106,3 @@ php -d extension=gameshark.so \
   -d gameshark.invariants_file=/path/to/invariants.php \
   script.php
 ```
-

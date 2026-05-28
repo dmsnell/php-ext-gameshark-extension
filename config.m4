@@ -14,15 +14,15 @@ if test "$PHP_GAMESHARK" != "no"; then
   if test -z "$GAMESHARK_PHP_VERSION_ID"; then
     AC_MSG_ERROR([could not determine PHP version from php-config])
   fi
-  if test "$GAMESHARK_PHP_VERSION_ID" -lt 80000; then
-    AC_MSG_ERROR([gameshark requires PHP 8.0.0 or newer])
+  if test "$GAMESHARK_PHP_VERSION_ID" -lt 80200; then
+    AC_MSG_ERROR([gameshark requires PHP 8.2.0 or newer])
   fi
   AC_MSG_RESULT([$GAMESHARK_PHP_VERSION_ID])
 
   AC_MSG_CHECKING([for Zend observer API])
   GAMESHARK_PHP_INCLUDE_DIR=`$PHP_CONFIG --include-dir 2>/dev/null`
   if test -z "$GAMESHARK_PHP_INCLUDE_DIR" || test ! -r "$GAMESHARK_PHP_INCLUDE_DIR/Zend/zend_observer.h"; then
-    AC_MSG_ERROR([gameshark requires Zend/zend_observer.h from PHP 8.0+])
+    AC_MSG_ERROR([gameshark requires Zend/zend_observer.h from PHP 8.2+])
   fi
   AC_MSG_RESULT([yes])
 

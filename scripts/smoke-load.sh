@@ -43,5 +43,21 @@ if [[ "$REPORT" != *"gameshark_smoke"* ]]; then
   exit 1
 fi
 
-printf 'gameshark smoke check passed with %s\n' "$PHP_BIN"
+UNUSED_DB_PATH="$(mktemp "${TMPDIR:-/tmp}/gameshark-unused-smoke.XXXXXX.sqlite")"
+trap 'rm -f "$DB_PATH" "$UNUSED_DB_PATH"' EXIT
 
+GAMESHARK_DB="$UNUSED_DB_PATH" \
+GAMESHARK_UNUSED=1 \
+"$PHP_BIN" -n -d "extension=$EXTENSION" -r 'function gameshark_called_smoke() {} function gameshark_uncalled_smoke() {} gameshark_called_smoke();'
+
+UNUSED_REPORT="$(
+  GAMESHARK_DB="$UNUSED_DB_PATH" "$PHP_BIN" -n -d "extension=$EXTENSION" -r 'echo gameshark_unused_report("json");'
+)"
+
+if [[ "$UNUSED_REPORT" != *"gameshark_uncalled_smoke"* || "$UNUSED_REPORT" == *"gameshark_called_smoke"* ]]; then
+  echo "unused smoke report did not contain expected uncalled function" >&2
+  echo "$UNUSED_REPORT" >&2
+  exit 1
+fi
+
+printf 'gameshark smoke check passed with %s\n' "$PHP_BIN"

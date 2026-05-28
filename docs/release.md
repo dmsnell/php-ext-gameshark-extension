@@ -22,8 +22,8 @@
 
 The intended CI matrix is:
 
-- Linux, PHP 8.0 through the latest available PHP 8.x stable.
-- macOS, PHP 8.0 through the latest available PHP 8.x stable.
+- Linux, PHP 8.2 through the latest available PHP 8.x stable.
+- macOS, PHP 8.2 through the latest available PHP 8.x stable.
 - Non-blocking current or nightly PHP lane.
 
 Each lane should run:
@@ -33,4 +33,3 @@ PHP_CONFIG=/path/to/php-config scripts/build-unix.sh
 scripts/package-source.sh --no-vendor
 PHP_CONFIG=/path/to/php-config scripts/package-binary-unix.sh
 ```
-

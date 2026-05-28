@@ -74,13 +74,15 @@
         <file name="017-invariants-builtins-exceptions.phpt" role="test" />
         <file name="018-invariants-wp-error-stdout.phpt" role="test" />
         <file name="019-trace-allow-pattern.phpt" role="test" />
+        <file name="020-unused-basic.phpt" role="test" />
+        <file name="021-unused-generated-matrix.phpt" role="test" />
       </dir>
     </dir>
   </contents>
   <dependencies>
     <required>
       <php>
-        <min>8.0.0</min>
+        <min>8.2.0</min>
       </php>
       <pearinstaller>
         <min>1.10.0</min>

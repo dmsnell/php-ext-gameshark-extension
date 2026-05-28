@@ -50,8 +50,8 @@ if [[ ! -x "$PHPIZE" ]]; then
 fi
 
 PHP_VERSION_ID="$("$PHP_CONFIG" --vernum)"
-if [[ -z "$PHP_VERSION_ID" || "$PHP_VERSION_ID" -lt 80000 ]]; then
-  echo "gameshark requires PHP 8.0.0 or newer; php-config reported ${PHP_VERSION_ID:-unknown}" >&2
+if [[ -z "$PHP_VERSION_ID" || "$PHP_VERSION_ID" -lt 80200 ]]; then
+  echo "gameshark requires PHP 8.2.0 or newer; php-config reported ${PHP_VERSION_ID:-unknown}" >&2
   exit 1
 fi
 
@@ -95,4 +95,3 @@ if [[ "${RUN_SMOKE:-1}" != "0" ]]; then
 fi
 
 printf 'gameshark built successfully: %s\n' "$(pwd)/modules/gameshark.so"
-

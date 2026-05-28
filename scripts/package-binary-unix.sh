@@ -50,8 +50,14 @@ PHP_API="$(awk -F'=> ' '/^PHP API/ { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; 
 THREAD_SAFETY="$(awk -F'=> ' '/^Thread Safety/ { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }' <<< "$PHP_INFO")"
 DEBUG_BUILD="$(awk -F'=> ' '/^Debug Build/ { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }' <<< "$PHP_INFO")"
 
+if (( PHP_VERSION_ID < 80200 )); then
+  echo "gameshark binary packages require PHP 8.2 or newer; got $PHP_VERSION" >&2
+  exit 1
+fi
+
 if [[ "$THREAD_SAFETY" == "enabled" ]]; then
-  THREAD_TAG="zts"
+  echo "gameshark does not support ZTS PHP builds" >&2
+  exit 1
 else
   THREAD_TAG="nts"
 fi
@@ -67,6 +73,11 @@ PACKAGE_NAME="gameshark-$VERSION-php$PHP_MINOR-$OS_TAG-$ARCH_TAG-$DEBUG_TAG-$THR
 STAGE_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/gameshark-bin.XXXXXX")"
 trap 'rm -rf "$STAGE_PARENT"' EXIT
 PACKAGE_ROOT="$STAGE_PARENT/$PACKAGE_NAME"
+
+if ! "$PHP_BIN" -n -d "extension=$EXTENSION" --ri gameshark >/dev/null 2>&1; then
+  echo "selected PHP binary cannot load $EXTENSION; rebuild with matching php-config/PHP binary" >&2
+  exit 1
+fi
 
 mkdir -p "$PACKAGE_ROOT" dist
 cp "$EXTENSION" "$PACKAGE_ROOT/gameshark.so"

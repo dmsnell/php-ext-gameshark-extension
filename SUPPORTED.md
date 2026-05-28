@@ -4,7 +4,8 @@
 
 | Target | Status | Notes |
 | --- | --- | --- |
-| PHP 8.0+ | Supported | Requires the Zend Observer API. |
+| PHP 8.2+ | Supported | Requires declaration observer APIs used by unused coverage mode. |
+| PHP 8.0-8.1 | Unsupported | These versions lack declaration observer APIs used by unused coverage mode. |
 | PHP 7.4 | Unsupported | PHP 7.4 lacks the observer API this extension uses. |
 | Linux | Supported | Source and binary package scripts are provided. |
 | macOS | Supported | Source and binary package scripts are provided. |
@@ -17,7 +18,7 @@
 The extension fails closed during `configure` when a target is outside the
 supported surface:
 
-- `php-config --vernum` must report PHP 8.0.0 or newer.
+- `php-config --vernum` must report PHP 8.2.0 or newer.
 - `Zend/zend_observer.h` must exist in the target PHP include directory.
 - The target PHP build must not be ZTS.
 - The host OS must be Linux or macOS.
@@ -49,4 +50,3 @@ Windows support should be treated as a separate project:
 - Build with the PHP SDK and the same Visual Studio toolset as the target PHP.
 - Build the Rust static library for the matching MSVC target.
 - Test NTS and ZTS separately if ZTS support is added.
-

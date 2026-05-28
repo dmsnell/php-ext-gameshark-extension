@@ -2,7 +2,7 @@ use regex::Regex;
 use rusqlite::{params, Connection, Transaction};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::fmt::Write as _;
 use std::os::raw::{c_char, c_int};
@@ -50,6 +50,27 @@ pub struct GamesharkCoreTransformedValue {
     preview: GamesharkCoreStr,
 }
 
+#[repr(C)]
+pub struct GamesharkCoreUnusedDeclaration {
+    kind: u8,
+    scope_name: GamesharkCoreStr,
+    name: GamesharkCoreStr,
+    file: GamesharkCoreStr,
+    start_line: u32,
+    end_line: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+pub struct GamesharkCoreUnusedAccess {
+    kind: u8,
+    scope_name: GamesharkCoreStr,
+    name: GamesharkCoreStr,
+    file: GamesharkCoreStr,
+    start_line: u32,
+    end_line: u32,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct FunctionKey {
     kind: FunctionKind,
@@ -92,6 +113,134 @@ impl FunctionKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum UnusedSymbolKind {
+    Function,
+    Method,
+    Closure,
+    Class,
+    GlobalConstant,
+    ClassConstant,
+}
+
+impl UnusedSymbolKind {
+    fn declaration_from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Function),
+            2 => Some(Self::Method),
+            3 => Some(Self::Class),
+            4 => Some(Self::GlobalConstant),
+            5 => Some(Self::ClassConstant),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Method => "method",
+            Self::Closure => "closure",
+            Self::Class => "class",
+            Self::GlobalConstant => "global_constant",
+            Self::ClassConstant => "class_constant",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum UnusedAccessKind {
+    FunctionCall,
+    MethodCall,
+    ClosureCall,
+    NewOpcodeObserved,
+    GlobalConstantFetchObserved,
+    ClassConstantFetchObserved,
+    GlobalConstantRead,
+    ClassConstantRead,
+    GlobalConstantProbe,
+    ClassConstantProbe,
+}
+
+impl UnusedAccessKind {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::FunctionCall),
+            2 => Some(Self::MethodCall),
+            3 => Some(Self::ClosureCall),
+            4 => Some(Self::NewOpcodeObserved),
+            5 => Some(Self::GlobalConstantFetchObserved),
+            6 => Some(Self::ClassConstantFetchObserved),
+            7 => Some(Self::GlobalConstantRead),
+            8 => Some(Self::ClassConstantRead),
+            9 => Some(Self::GlobalConstantProbe),
+            10 => Some(Self::ClassConstantProbe),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FunctionCall => "function_call",
+            Self::MethodCall => "method_call",
+            Self::ClosureCall => "closure_call",
+            Self::NewOpcodeObserved => "new_opcode_observed",
+            Self::GlobalConstantFetchObserved => "global_constant_fetch_observed",
+            Self::ClassConstantFetchObserved => "class_constant_fetch_observed",
+            Self::GlobalConstantRead => "global_constant_read",
+            Self::ClassConstantRead => "class_constant_read",
+            Self::GlobalConstantProbe => "global_constant_probe",
+            Self::ClassConstantProbe => "class_constant_probe",
+        }
+    }
+
+    fn symbol_kind(self) -> UnusedSymbolKind {
+        match self {
+            Self::FunctionCall => UnusedSymbolKind::Function,
+            Self::MethodCall => UnusedSymbolKind::Method,
+            Self::ClosureCall => UnusedSymbolKind::Closure,
+            Self::NewOpcodeObserved => UnusedSymbolKind::Class,
+            Self::GlobalConstantFetchObserved
+            | Self::GlobalConstantRead
+            | Self::GlobalConstantProbe => UnusedSymbolKind::GlobalConstant,
+            Self::ClassConstantFetchObserved
+            | Self::ClassConstantRead
+            | Self::ClassConstantProbe => UnusedSymbolKind::ClassConstant,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct UnusedSymbolKey {
+    kind: UnusedSymbolKind,
+    scope_name: Option<String>,
+    name: String,
+}
+
+struct UnusedDeclaration {
+    key: UnusedSymbolKey,
+    display_name: String,
+    scope_name: Option<String>,
+    name: String,
+    file: Option<String>,
+    start_line: u32,
+    end_line: u32,
+    flags: u32,
+}
+
+struct UnusedAccess {
+    key: UnusedSymbolKey,
+    access_kind: UnusedAccessKind,
+    display_name: String,
+    scope_name: Option<String>,
+    name: String,
+    file: Option<String>,
+    start_line: u32,
+    end_line: u32,
+    count: u64,
+}
+
 struct State {
     db_path: String,
     side: Option<String>,
@@ -107,6 +256,10 @@ struct State {
     counters: HashMap<FunctionKey, u64>,
     trace_events: Vec<TraceEvent>,
     transformed_values: Vec<TransformedValue>,
+    unused_run_id: Option<i64>,
+    unused_declarations: HashMap<UnusedSymbolKey, UnusedDeclaration>,
+    unused_accesses: HashMap<(UnusedSymbolKey, UnusedAccessKind), UnusedAccess>,
+    unused_caveats: HashSet<String>,
 }
 
 struct TraceFilter {
@@ -272,6 +425,67 @@ struct TraceEventReport {
     stack_frames: serde_json::Value,
 }
 
+#[derive(Serialize)]
+struct UnusedReport {
+    summary: UnusedSummary,
+    run: Option<UnusedRunReport>,
+    uncalled_functions: Vec<UnusedReportRow>,
+    uncalled_concrete_methods: Vec<UnusedReportRow>,
+    classes_with_no_new_opcode_observed: Vec<UnusedReportRow>,
+    global_constants_without_read_observed: Vec<UnusedReportRow>,
+    class_constants_without_read_observed: Vec<UnusedReportRow>,
+}
+
+#[derive(Serialize)]
+struct UnusedSummary {
+    run_count: usize,
+    run_id: Option<i64>,
+    declaration_count: usize,
+    access_count: usize,
+    uncalled_function_count: usize,
+    uncalled_concrete_method_count: usize,
+    class_without_new_count: usize,
+    global_constant_without_read_count: usize,
+    class_constant_without_read_count: usize,
+}
+
+#[derive(Serialize)]
+struct UnusedRunReport {
+    run_id: i64,
+    started_at: i64,
+    finished_at: Option<i64>,
+    status: String,
+    php_version: String,
+    sapi: String,
+    pid: u32,
+    script_filename: Option<String>,
+    request_path: Option<String>,
+    request_uri_full: Option<String>,
+    query_string: Option<String>,
+    new_opcode_handler_active: bool,
+    constant_opcode_handler_active: bool,
+    class_constant_opcode_handler_active: bool,
+    caveats: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct UnusedReportRow {
+    kind: String,
+    display_name: String,
+    scope_name: Option<String>,
+    name: String,
+    file: Option<String>,
+    start_line: u32,
+    end_line: u32,
+    flags: u32,
+    call_count: u64,
+    new_opcode_observed_count: u64,
+    fetch_observed_count: u64,
+    read_observed_count: u64,
+    defined_probe_count: u64,
+    file_had_any_access: Option<bool>,
+}
+
 static STATE: LazyLock<Mutex<Option<State>>> = LazyLock::new(|| Mutex::new(None));
 
 #[no_mangle]
@@ -284,6 +498,13 @@ pub extern "C" fn gameshark_core_request_start(
     sapi_name: *const c_char,
     pid: u32,
     script_filename: *const c_char,
+    unused_enabled: c_int,
+    request_path: *const c_char,
+    request_uri_full: *const c_char,
+    query_string: *const c_char,
+    new_opcode_handler_active: c_int,
+    constant_opcode_handler_active: c_int,
+    class_constant_opcode_handler_active: c_int,
 ) -> c_int {
     let Some(db_path) = c_string(db_path) else {
         return 0;
@@ -297,13 +518,17 @@ pub extern "C" fn gameshark_core_request_start(
     }
 
     let trace_value = c_string(trace_value).filter(|value| !value.is_empty());
-    if side.is_none() && trace_value.is_none() {
+    let unused_enabled = unused_enabled != 0;
+    if side.is_none() && trace_value.is_none() && !unused_enabled {
         return 0;
     }
 
     let php_version = c_string(php_version).unwrap_or_default();
     let sapi_name = c_string(sapi_name).unwrap_or_default();
     let script_filename = c_string(script_filename).filter(|value| !value.is_empty());
+    let request_path = c_string(request_path).filter(|value| !value.is_empty());
+    let request_uri_full = c_string(request_uri_full).filter(|value| !value.is_empty());
+    let query_string = c_string(query_string).filter(|value| !value.is_empty());
     let started_at = now();
     let started_at_ns = now_ns();
     let trace_value_kind = trace_value.as_deref().map(trace_value_kind);
@@ -344,6 +569,47 @@ pub extern "C" fn gameshark_core_request_start(
         None
     };
 
+    let mut unused_caveats = HashSet::new();
+    let unused_run_id = if unused_enabled {
+        if new_opcode_handler_active == 0 {
+            unused_caveats.insert(
+                "ZEND_NEW opcode handler unavailable because another extension already registered one"
+                    .to_string(),
+            );
+        }
+        if constant_opcode_handler_active == 0 {
+            unused_caveats.insert(
+                "ZEND_FETCH_CONSTANT opcode handler unavailable because another extension already registered one"
+                    .to_string(),
+            );
+        }
+        if class_constant_opcode_handler_active == 0 {
+            unused_caveats.insert(
+                "ZEND_FETCH_CLASS_CONSTANT opcode handler unavailable because another extension already registered one"
+                    .to_string(),
+            );
+        }
+        match initialize_unused_run(
+            &db_path,
+            started_at_ns,
+            &php_version,
+            &sapi_name,
+            pid,
+            script_filename.as_deref(),
+            request_path.as_deref(),
+            request_uri_full.as_deref(),
+            query_string.as_deref(),
+            new_opcode_handler_active != 0,
+            constant_opcode_handler_active != 0,
+            class_constant_opcode_handler_active != 0,
+        ) {
+            Ok(run_id) => Some(run_id),
+            Err(_) => return 0,
+        }
+    } else {
+        None
+    };
+
     let mut state = STATE.lock().expect("gameshark state lock poisoned");
     *state = Some(State {
         db_path,
@@ -360,6 +626,10 @@ pub extern "C" fn gameshark_core_request_start(
         counters: HashMap::new(),
         trace_events: Vec::new(),
         transformed_values: Vec::new(),
+        unused_run_id,
+        unused_declarations: HashMap::new(),
+        unused_accesses: HashMap::new(),
+        unused_caveats,
     });
     1
 }
@@ -473,7 +743,11 @@ pub unsafe extern "C" fn gameshark_core_record_trace_event(event: *const Gamesha
         return;
     }
 
-    let mut elapsed_ns = state.started_monotonic.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    let mut elapsed_ns = state
+        .started_monotonic
+        .elapsed()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64;
     if elapsed_ns <= state.last_elapsed_ns {
         elapsed_ns = state.last_elapsed_ns.saturating_add(1);
     }
@@ -519,7 +793,11 @@ pub unsafe extern "C" fn gameshark_core_record_transformed_value(
         return;
     }
 
-    let mut elapsed_ns = state.started_monotonic.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    let mut elapsed_ns = state
+        .started_monotonic
+        .elapsed()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64;
     if elapsed_ns <= state.last_elapsed_ns {
         elapsed_ns = state.last_elapsed_ns.saturating_add(1);
     }
@@ -534,6 +812,107 @@ pub unsafe extern "C" fn gameshark_core_record_transformed_value(
         value: transformed_value,
         preview,
     });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gameshark_core_record_unused_declaration(
+    declaration: *const GamesharkCoreUnusedDeclaration,
+) {
+    let Some(declaration) = declaration.as_ref() else {
+        return;
+    };
+    let Some(kind) = UnusedSymbolKind::declaration_from_u8(declaration.kind) else {
+        return;
+    };
+    let Some(name) = ffi_str(&declaration.name).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let scope_name = ffi_str(&declaration.scope_name).filter(|value| !value.is_empty());
+    let file = ffi_str(&declaration.file).filter(|value| !value.is_empty());
+    let key = unused_symbol_key(kind.clone(), scope_name.as_deref(), &name);
+    let display_name = unused_display_name(&kind, scope_name.as_deref(), &name);
+
+    let mut state = STATE.lock().expect("gameshark state lock poisoned");
+    let Some(state) = state.as_mut() else {
+        return;
+    };
+    if state.unused_run_id.is_none() {
+        return;
+    }
+
+    state.unused_declarations.insert(
+        key.clone(),
+        UnusedDeclaration {
+            key,
+            display_name,
+            scope_name,
+            name,
+            file,
+            start_line: declaration.start_line,
+            end_line: declaration.end_line,
+            flags: declaration.flags,
+        },
+    );
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gameshark_core_record_unused_access(
+    access: *const GamesharkCoreUnusedAccess,
+) {
+    let Some(access) = access.as_ref() else {
+        return;
+    };
+    let Some(access_kind) = UnusedAccessKind::from_u8(access.kind) else {
+        return;
+    };
+    let Some(name) = ffi_str(&access.name).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let scope_name = ffi_str(&access.scope_name).filter(|value| !value.is_empty());
+    let file = ffi_str(&access.file).filter(|value| !value.is_empty());
+    let symbol_kind = access_kind.symbol_kind();
+    let key = unused_symbol_key(symbol_kind.clone(), scope_name.as_deref(), &name);
+    let map_key = (key.clone(), access_kind);
+    let display_name = unused_display_name(&symbol_kind, scope_name.as_deref(), &name);
+
+    let mut state = STATE.lock().expect("gameshark state lock poisoned");
+    let Some(state) = state.as_mut() else {
+        return;
+    };
+    if state.unused_run_id.is_none() {
+        return;
+    }
+
+    state
+        .unused_accesses
+        .entry(map_key)
+        .and_modify(|existing| existing.count += 1)
+        .or_insert(UnusedAccess {
+            key,
+            access_kind,
+            display_name,
+            scope_name,
+            name,
+            file,
+            start_line: access.start_line,
+            end_line: access.end_line,
+            count: 1,
+        });
+}
+
+#[no_mangle]
+pub extern "C" fn gameshark_core_record_unused_caveat(caveat: *const c_char) {
+    let Some(caveat) = c_string(caveat).filter(|value| !value.is_empty()) else {
+        return;
+    };
+
+    let mut state = STATE.lock().expect("gameshark state lock poisoned");
+    let Some(state) = state.as_mut() else {
+        return;
+    };
+    if state.unused_run_id.is_some() {
+        state.unused_caveats.insert(caveat);
+    }
 }
 
 #[no_mangle]
@@ -590,10 +969,57 @@ pub extern "C" fn gameshark_core_trace_report_json(db_path: *const c_char) -> *m
 }
 
 #[no_mangle]
-pub extern "C" fn gameshark_core_trace_report_text(db_path: *const c_char, color: c_int) -> *mut c_char {
+pub extern "C" fn gameshark_core_trace_report_text(
+    db_path: *const c_char,
+    color: c_int,
+) -> *mut c_char {
     report_text(db_path, |db_path| {
         let report = trace_report(db_path)?;
         Ok(render_trace_text(&report, color != 0))
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn gameshark_core_unused_report_json(
+    db_path: *const c_char,
+    run_id: i64,
+) -> *mut c_char {
+    report_json(
+        db_path,
+        |db_path| unused_report_json(db_path, run_id),
+        || {
+            serde_json::json!({
+                "summary": {
+                    "run_count": 0,
+                    "run_id": null,
+                    "declaration_count": 0,
+                    "access_count": 0,
+                    "uncalled_function_count": 0,
+                    "uncalled_concrete_method_count": 0,
+                    "class_without_new_count": 0,
+                    "global_constant_without_read_count": 0,
+                    "class_constant_without_read_count": 0
+                },
+                "run": null,
+                "uncalled_functions": [],
+                "uncalled_concrete_methods": [],
+                "classes_with_no_new_opcode_observed": [],
+                "global_constants_without_read_observed": [],
+                "class_constants_without_read_observed": []
+            })
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn gameshark_core_unused_report_text(
+    db_path: *const c_char,
+    color: c_int,
+    run_id: i64,
+) -> *mut c_char {
+    report_text(db_path, |db_path| {
+        let report = unused_report(db_path, run_id)?;
+        Ok(render_unused_text(&report, color != 0))
     })
 }
 
@@ -815,6 +1241,52 @@ fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 FOREIGN KEY (run_id) REFERENCES trace_runs(run_id),
                 FOREIGN KEY (function_id) REFERENCES functions(function_id)
             );
+            CREATE TABLE IF NOT EXISTS unused_runs (
+                run_id INTEGER PRIMARY KEY,
+                started_at INTEGER NOT NULL,
+                finished_at INTEGER,
+                status TEXT NOT NULL,
+                php_version TEXT,
+                sapi TEXT,
+                pid INTEGER,
+                script_filename TEXT,
+                request_path TEXT,
+                request_uri_full TEXT,
+                query_string TEXT,
+                new_opcode_handler_active INTEGER NOT NULL DEFAULT 0,
+                constant_opcode_handler_active INTEGER NOT NULL DEFAULT 0,
+                class_constant_opcode_handler_active INTEGER NOT NULL DEFAULT 0,
+                caveats_json TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE IF NOT EXISTS unused_declarations (
+                run_id INTEGER NOT NULL,
+                identity_hash TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                scope_name TEXT,
+                name TEXT NOT NULL,
+                file TEXT,
+                start_line INTEGER,
+                end_line INTEGER,
+                flags INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (run_id, identity_hash),
+                FOREIGN KEY (run_id) REFERENCES unused_runs(run_id)
+            );
+            CREATE TABLE IF NOT EXISTS unused_accesses (
+                run_id INTEGER NOT NULL,
+                identity_hash TEXT NOT NULL,
+                access_kind TEXT NOT NULL,
+                symbol_kind TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                scope_name TEXT,
+                name TEXT NOT NULL,
+                file TEXT,
+                start_line INTEGER,
+                end_line INTEGER,
+                access_count INTEGER NOT NULL,
+                PRIMARY KEY (run_id, identity_hash, access_kind),
+                FOREIGN KEY (run_id) REFERENCES unused_runs(run_id)
+            );
             ",
         )
         .map_err(|error| error.to_string())?;
@@ -829,7 +1301,10 @@ fn initialize_schema(connection: &Connection) -> Result<(), String> {
     }
     if !column_exists(connection, "trace_events", "observed_value")? {
         connection
-            .execute("ALTER TABLE trace_events ADD COLUMN observed_value TEXT", [])
+            .execute(
+                "ALTER TABLE trace_events ADD COLUMN observed_value TEXT",
+                [],
+            )
             .map_err(|error| error.to_string())?;
     }
     if !column_exists(connection, "trace_events", "matched_value_id")? {
@@ -951,7 +1426,9 @@ fn initialize_side(
 ) -> Result<(), String> {
     let mut connection = open_db(db_path)?;
     initialize_schema(&connection)?;
-    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
     transaction
         .execute("DELETE FROM function_counts WHERE side = ?", params![side])
         .map_err(|error| error.to_string())?;
@@ -1025,10 +1502,71 @@ fn initialize_trace_run(
     Ok(connection.last_insert_rowid())
 }
 
+fn initialize_unused_run(
+    db_path: &str,
+    started_at: i64,
+    php_version: &str,
+    sapi_name: &str,
+    pid: u32,
+    script_filename: Option<&str>,
+    request_path: Option<&str>,
+    request_uri_full: Option<&str>,
+    query_string: Option<&str>,
+    new_opcode_handler_active: bool,
+    constant_opcode_handler_active: bool,
+    class_constant_opcode_handler_active: bool,
+) -> Result<i64, String> {
+    let connection = open_db(db_path)?;
+    initialize_schema(&connection)?;
+    let mut caveats = Vec::new();
+    if !new_opcode_handler_active {
+        caveats.push(
+            "ZEND_NEW opcode handler unavailable because another extension already registered one",
+        );
+    }
+    if !constant_opcode_handler_active {
+        caveats.push("ZEND_FETCH_CONSTANT opcode handler unavailable because another extension already registered one");
+    }
+    if !class_constant_opcode_handler_active {
+        caveats.push("ZEND_FETCH_CLASS_CONSTANT opcode handler unavailable because another extension already registered one");
+    }
+    let caveats_json = serde_json::to_string(&caveats).map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "
+            INSERT INTO unused_runs (
+                started_at, finished_at, status, php_version, sapi, pid, script_filename,
+                request_path, request_uri_full, query_string,
+                new_opcode_handler_active, constant_opcode_handler_active,
+                class_constant_opcode_handler_active, caveats_json
+            )
+            VALUES (?, NULL, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ",
+            params![
+                started_at,
+                php_version,
+                sapi_name,
+                pid,
+                script_filename,
+                request_path,
+                request_uri_full,
+                query_string,
+                new_opcode_handler_active,
+                constant_opcode_handler_active,
+                class_constant_opcode_handler_active,
+                caveats_json,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(connection.last_insert_rowid())
+}
+
 fn flush_state(state: State) -> Result<(), String> {
     let mut connection = open_db(&state.db_path)?;
     initialize_schema(&connection)?;
-    let transaction = connection.transaction().map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
 
     if let Some(side) = state.side.as_deref() {
         flush_counts(&transaction, side, &state.counters)?;
@@ -1101,6 +1639,38 @@ fn flush_state(state: State) -> Result<(), String> {
                     state.trace_filter.counters.args_inspected,
                     state.trace_filter.counters.calls_with_value_matches,
                     state.trace_filter.counters.transform_frames_started,
+                    run_id
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+
+    if let Some(run_id) = state.unused_run_id {
+        flush_unused_declarations(&transaction, run_id, &state.unused_declarations)?;
+        flush_unused_accesses(&transaction, run_id, &state.unused_accesses)?;
+        let mut caveats: Vec<_> = state.unused_caveats.into_iter().collect();
+        caveats.sort();
+        let caveats_json = serde_json::to_string(&caveats).map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "
+                UPDATE unused_runs
+                SET finished_at = ?,
+                    status = 'complete',
+                    php_version = ?,
+                    sapi = ?,
+                    pid = ?,
+                    script_filename = ?,
+                    caveats_json = ?
+                WHERE run_id = ?
+                ",
+                params![
+                    now_ns(),
+                    state.php_version,
+                    state.sapi_name,
+                    state.pid,
+                    state.script_filename,
+                    caveats_json,
                     run_id
                 ],
             )
@@ -1200,6 +1770,93 @@ fn flush_transformed_values(
                     value.transform_kind,
                     value.value,
                     value.preview
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn flush_unused_declarations(
+    transaction: &Transaction<'_>,
+    run_id: i64,
+    declarations: &HashMap<UnusedSymbolKey, UnusedDeclaration>,
+) -> Result<(), String> {
+    for declaration in declarations.values() {
+        let identity_hash = unused_identity_hash(&declaration.key);
+        transaction
+            .execute(
+                "
+                INSERT INTO unused_declarations (
+                    run_id, identity_hash, kind, display_name, scope_name, name,
+                    file, start_line, end_line, flags
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, identity_hash) DO UPDATE SET
+                    kind = excluded.kind,
+                    display_name = excluded.display_name,
+                    scope_name = excluded.scope_name,
+                    name = excluded.name,
+                    file = excluded.file,
+                    start_line = excluded.start_line,
+                    end_line = excluded.end_line,
+                    flags = excluded.flags
+                ",
+                params![
+                    run_id,
+                    identity_hash,
+                    declaration.key.kind.as_str(),
+                    declaration.display_name,
+                    declaration.scope_name,
+                    declaration.name,
+                    declaration.file,
+                    declaration.start_line,
+                    declaration.end_line,
+                    declaration.flags
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn flush_unused_accesses(
+    transaction: &Transaction<'_>,
+    run_id: i64,
+    accesses: &HashMap<(UnusedSymbolKey, UnusedAccessKind), UnusedAccess>,
+) -> Result<(), String> {
+    for access in accesses.values() {
+        let identity_hash = unused_identity_hash(&access.key);
+        transaction
+            .execute(
+                "
+                INSERT INTO unused_accesses (
+                    run_id, identity_hash, access_kind, symbol_kind, display_name,
+                    scope_name, name, file, start_line, end_line, access_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, identity_hash, access_kind) DO UPDATE SET
+                    symbol_kind = excluded.symbol_kind,
+                    display_name = excluded.display_name,
+                    scope_name = excluded.scope_name,
+                    name = excluded.name,
+                    file = excluded.file,
+                    start_line = excluded.start_line,
+                    end_line = excluded.end_line,
+                    access_count = excluded.access_count
+                ",
+                params![
+                    run_id,
+                    identity_hash,
+                    access.access_kind.as_str(),
+                    access.key.kind.as_str(),
+                    access.display_name,
+                    access.scope_name,
+                    access.name,
+                    access.file,
+                    access.start_line,
+                    access.end_line,
+                    access.count
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -1427,6 +2084,454 @@ fn trace_report(db_path: &str) -> Result<TraceReport, String> {
     })
 }
 
+fn unused_report_json(db_path: &str, requested_run_id: i64) -> Result<String, String> {
+    serde_json::to_string(&unused_report(db_path, requested_run_id)?)
+        .map_err(|error| error.to_string())
+}
+
+fn unused_report(db_path: &str, requested_run_id: i64) -> Result<UnusedReport, String> {
+    let connection = open_db(db_path)?;
+    initialize_schema(&connection)?;
+    let run_count: usize = connection
+        .query_row("SELECT COUNT(*) FROM unused_runs", [], |row| {
+            row.get::<_, u64>(0)
+        })
+        .map_err(|error| error.to_string())? as usize;
+    let run_id = select_unused_run_id(&connection, requested_run_id)?;
+    let run = unused_run_for_id(&connection, run_id)?;
+    let declarations = unused_declarations_for_run(&connection, run_id)?;
+    let accesses = unused_accesses_for_run(&connection, run_id)?;
+    let mut declaration_by_key = HashMap::new();
+    let mut class_flags_by_name = HashMap::new();
+    for declaration in &declarations {
+        declaration_by_key.insert(declaration.key.clone(), declaration);
+        if declaration.key.kind == UnusedSymbolKind::Class {
+            class_flags_by_name.insert(declaration.key.name.clone(), declaration.flags);
+        }
+    }
+
+    let mut active_files = HashSet::new();
+    for access in &accesses {
+        if let Some(file) = access.file.as_deref() {
+            active_files.insert(file.to_string());
+        }
+        if let Some(declaration) = declaration_by_key.get(&access.key) {
+            if let Some(file) = declaration.file.as_deref() {
+                active_files.insert(file.to_string());
+            }
+        }
+    }
+
+    let mut access_counts: HashMap<(UnusedSymbolKey, UnusedAccessKind), u64> = HashMap::new();
+    for access in &accesses {
+        access_counts.insert((access.key.clone(), access.access_kind), access.count);
+    }
+
+    let mut uncalled_functions = Vec::new();
+    let mut uncalled_concrete_methods = Vec::new();
+    let mut classes_with_no_new_opcode_observed = Vec::new();
+    let mut global_constants_without_read_observed = Vec::new();
+    let mut class_constants_without_read_observed = Vec::new();
+
+    for declaration in &declarations {
+        match declaration.key.kind {
+            UnusedSymbolKind::Function => {
+                let call_count = access_count(
+                    &access_counts,
+                    &declaration.key,
+                    UnusedAccessKind::FunctionCall,
+                );
+                if call_count == 0 {
+                    uncalled_functions.push(unused_row(declaration, &access_counts, &active_files));
+                }
+            }
+            UnusedSymbolKind::Method => {
+                let call_count = access_count(
+                    &access_counts,
+                    &declaration.key,
+                    UnusedAccessKind::MethodCall,
+                );
+                let owning_class_flags = declaration
+                    .key
+                    .scope_name
+                    .as_ref()
+                    .and_then(|scope| class_flags_by_name.get(scope))
+                    .copied()
+                    .unwrap_or(0);
+                if call_count == 0
+                    && declaration.flags & ZEND_ACC_ABSTRACT_FLAG == 0
+                    && owning_class_flags & ZEND_ACC_UNINSTANTIABLE_FLAGS == 0
+                {
+                    uncalled_concrete_methods.push(unused_row(
+                        declaration,
+                        &access_counts,
+                        &active_files,
+                    ));
+                }
+            }
+            UnusedSymbolKind::Class => {
+                let new_count = access_count(
+                    &access_counts,
+                    &declaration.key,
+                    UnusedAccessKind::NewOpcodeObserved,
+                );
+                if new_count == 0 && declaration.flags & ZEND_ACC_UNINSTANTIABLE_FLAGS == 0 {
+                    classes_with_no_new_opcode_observed.push(unused_row(
+                        declaration,
+                        &access_counts,
+                        &active_files,
+                    ));
+                }
+            }
+            UnusedSymbolKind::GlobalConstant => {
+                let read_count = access_count(
+                    &access_counts,
+                    &declaration.key,
+                    UnusedAccessKind::GlobalConstantRead,
+                );
+                if read_count == 0 {
+                    global_constants_without_read_observed.push(unused_row(
+                        declaration,
+                        &access_counts,
+                        &active_files,
+                    ));
+                }
+            }
+            UnusedSymbolKind::ClassConstant => {
+                let read_count = access_count(
+                    &access_counts,
+                    &declaration.key,
+                    UnusedAccessKind::ClassConstantRead,
+                );
+                if read_count == 0 {
+                    class_constants_without_read_observed.push(unused_row(
+                        declaration,
+                        &access_counts,
+                        &active_files,
+                    ));
+                }
+            }
+            UnusedSymbolKind::Closure => {}
+        }
+    }
+
+    sort_unused_rows(&mut uncalled_functions);
+    sort_unused_rows(&mut uncalled_concrete_methods);
+    sort_unused_rows(&mut classes_with_no_new_opcode_observed);
+    sort_unused_rows(&mut global_constants_without_read_observed);
+    sort_unused_rows(&mut class_constants_without_read_observed);
+
+    Ok(UnusedReport {
+        summary: UnusedSummary {
+            run_count,
+            run_id: Some(run_id),
+            declaration_count: declarations.len(),
+            access_count: accesses.len(),
+            uncalled_function_count: uncalled_functions.len(),
+            uncalled_concrete_method_count: uncalled_concrete_methods.len(),
+            class_without_new_count: classes_with_no_new_opcode_observed.len(),
+            global_constant_without_read_count: global_constants_without_read_observed.len(),
+            class_constant_without_read_count: class_constants_without_read_observed.len(),
+        },
+        run: Some(run),
+        uncalled_functions,
+        uncalled_concrete_methods,
+        classes_with_no_new_opcode_observed,
+        global_constants_without_read_observed,
+        class_constants_without_read_observed,
+    })
+}
+
+const ZEND_ACC_ABSTRACT_FLAG: u32 = 1 << 6;
+const ZEND_ACC_INTERFACE_FLAG: u32 = 1 << 0;
+const ZEND_ACC_TRAIT_FLAG: u32 = 1 << 1;
+const ZEND_ACC_IMPLICIT_ABSTRACT_CLASS_FLAG: u32 = 1 << 4;
+const ZEND_ACC_EXPLICIT_ABSTRACT_CLASS_FLAG: u32 = 1 << 6;
+const ZEND_ACC_ENUM_FLAG: u32 = 1 << 28;
+const ZEND_ACC_UNINSTANTIABLE_FLAGS: u32 = ZEND_ACC_INTERFACE_FLAG
+    | ZEND_ACC_TRAIT_FLAG
+    | ZEND_ACC_IMPLICIT_ABSTRACT_CLASS_FLAG
+    | ZEND_ACC_EXPLICIT_ABSTRACT_CLASS_FLAG
+    | ZEND_ACC_ENUM_FLAG;
+
+fn select_unused_run_id(connection: &Connection, requested_run_id: i64) -> Result<i64, String> {
+    if requested_run_id >= 0 {
+        let found = connection
+            .query_row(
+                "SELECT run_id FROM unused_runs WHERE run_id = ?",
+                params![requested_run_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                if matches!(error, rusqlite::Error::QueryReturnedNoRows) {
+                    format!("unused run {requested_run_id} was not found")
+                } else {
+                    error.to_string()
+                }
+            })?;
+        return Ok(found);
+    }
+
+    connection
+        .query_row(
+            "
+            SELECT run_id
+            FROM unused_runs
+            WHERE status = 'complete'
+            ORDER BY COALESCE(finished_at, started_at) DESC, run_id DESC
+            LIMIT 1
+            ",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            if matches!(error, rusqlite::Error::QueryReturnedNoRows) {
+                "no completed unused runs recorded".to_string()
+            } else {
+                error.to_string()
+            }
+        })
+}
+
+fn unused_run_for_id(connection: &Connection, run_id: i64) -> Result<UnusedRunReport, String> {
+    connection
+        .query_row(
+            "
+            SELECT run_id, started_at, finished_at, status,
+                   COALESCE(php_version, ''), COALESCE(sapi, ''), COALESCE(pid, 0),
+                   script_filename, request_path, request_uri_full, query_string,
+                   COALESCE(new_opcode_handler_active, 0),
+                   COALESCE(constant_opcode_handler_active, 0),
+                   COALESCE(class_constant_opcode_handler_active, 0),
+                   COALESCE(caveats_json, '[]')
+            FROM unused_runs
+            WHERE run_id = ?
+            ",
+            params![run_id],
+            |row| {
+                let caveats_json: String = row.get(14)?;
+                let caveats = serde_json::from_str(&caveats_json).unwrap_or_default();
+                Ok(UnusedRunReport {
+                    run_id: row.get(0)?,
+                    started_at: row.get(1)?,
+                    finished_at: row.get(2)?,
+                    status: row.get(3)?,
+                    php_version: row.get(4)?,
+                    sapi: row.get(5)?,
+                    pid: row.get(6)?,
+                    script_filename: row.get(7)?,
+                    request_path: row.get(8)?,
+                    request_uri_full: row.get(9)?,
+                    query_string: row.get(10)?,
+                    new_opcode_handler_active: row.get::<_, bool>(11)?,
+                    constant_opcode_handler_active: row.get::<_, bool>(12)?,
+                    class_constant_opcode_handler_active: row.get::<_, bool>(13)?,
+                    caveats,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn unused_declarations_for_run(
+    connection: &Connection,
+    run_id: i64,
+) -> Result<Vec<UnusedDeclaration>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT kind, display_name, scope_name, name, file,
+                   COALESCE(start_line, 0), COALESCE(end_line, 0), COALESCE(flags, 0)
+            FROM unused_declarations
+            WHERE run_id = ?
+            ORDER BY display_name, file, start_line
+            ",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![run_id], |row| {
+            let kind_string: String = row.get(0)?;
+            let kind =
+                unused_symbol_kind_from_str(&kind_string).unwrap_or(UnusedSymbolKind::Function);
+            let scope_name: Option<String> = row.get(2)?;
+            let name: String = row.get(3)?;
+            let key = unused_symbol_key(kind.clone(), scope_name.as_deref(), &name);
+            Ok(UnusedDeclaration {
+                key,
+                display_name: row.get(1)?,
+                scope_name,
+                name,
+                file: row.get(4)?,
+                start_line: row.get(5)?,
+                end_line: row.get(6)?,
+                flags: row.get(7)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    let mut declarations = Vec::new();
+    for row in rows {
+        declarations.push(row.map_err(|error| error.to_string())?);
+    }
+    Ok(declarations)
+}
+
+fn unused_accesses_for_run(
+    connection: &Connection,
+    run_id: i64,
+) -> Result<Vec<UnusedAccess>, String> {
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT access_kind, symbol_kind, display_name, scope_name, name, file,
+                   COALESCE(start_line, 0), COALESCE(end_line, 0), access_count
+            FROM unused_accesses
+            WHERE run_id = ?
+            ORDER BY display_name, access_kind
+            ",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![run_id], |row| {
+            let access_kind_string: String = row.get(0)?;
+            let symbol_kind_string: String = row.get(1)?;
+            let access_kind = unused_access_kind_from_str(&access_kind_string)
+                .unwrap_or(UnusedAccessKind::FunctionCall);
+            let symbol_kind = unused_symbol_kind_from_str(&symbol_kind_string)
+                .unwrap_or_else(|| access_kind.symbol_kind());
+            let scope_name: Option<String> = row.get(3)?;
+            let name: String = row.get(4)?;
+            let key = unused_symbol_key(symbol_kind, scope_name.as_deref(), &name);
+            Ok(UnusedAccess {
+                key,
+                access_kind,
+                display_name: row.get(2)?,
+                scope_name,
+                name,
+                file: row.get(5)?,
+                start_line: row.get(6)?,
+                end_line: row.get(7)?,
+                count: row.get(8)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    let mut accesses = Vec::new();
+    for row in rows {
+        accesses.push(row.map_err(|error| error.to_string())?);
+    }
+    Ok(accesses)
+}
+
+fn unused_symbol_kind_from_str(value: &str) -> Option<UnusedSymbolKind> {
+    match value {
+        "function" => Some(UnusedSymbolKind::Function),
+        "method" => Some(UnusedSymbolKind::Method),
+        "closure" => Some(UnusedSymbolKind::Closure),
+        "class" => Some(UnusedSymbolKind::Class),
+        "global_constant" => Some(UnusedSymbolKind::GlobalConstant),
+        "class_constant" => Some(UnusedSymbolKind::ClassConstant),
+        _ => None,
+    }
+}
+
+fn unused_access_kind_from_str(value: &str) -> Option<UnusedAccessKind> {
+    match value {
+        "function_call" => Some(UnusedAccessKind::FunctionCall),
+        "method_call" => Some(UnusedAccessKind::MethodCall),
+        "closure_call" => Some(UnusedAccessKind::ClosureCall),
+        "new_opcode_observed" => Some(UnusedAccessKind::NewOpcodeObserved),
+        "global_constant_fetch_observed" => Some(UnusedAccessKind::GlobalConstantFetchObserved),
+        "class_constant_fetch_observed" => Some(UnusedAccessKind::ClassConstantFetchObserved),
+        "global_constant_read" => Some(UnusedAccessKind::GlobalConstantRead),
+        "class_constant_read" => Some(UnusedAccessKind::ClassConstantRead),
+        "global_constant_probe" => Some(UnusedAccessKind::GlobalConstantProbe),
+        "class_constant_probe" => Some(UnusedAccessKind::ClassConstantProbe),
+        _ => None,
+    }
+}
+
+fn access_count(
+    access_counts: &HashMap<(UnusedSymbolKey, UnusedAccessKind), u64>,
+    key: &UnusedSymbolKey,
+    access_kind: UnusedAccessKind,
+) -> u64 {
+    access_counts
+        .get(&(key.clone(), access_kind))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn unused_row(
+    declaration: &UnusedDeclaration,
+    access_counts: &HashMap<(UnusedSymbolKey, UnusedAccessKind), u64>,
+    active_files: &HashSet<String>,
+) -> UnusedReportRow {
+    let file_had_any_access = declaration
+        .file
+        .as_deref()
+        .map(|file| active_files.contains(file));
+    UnusedReportRow {
+        kind: declaration.key.kind.as_str().to_string(),
+        display_name: declaration.display_name.clone(),
+        scope_name: declaration.scope_name.clone(),
+        name: declaration.name.clone(),
+        file: declaration.file.clone(),
+        start_line: declaration.start_line,
+        end_line: declaration.end_line,
+        flags: declaration.flags,
+        call_count: access_count(
+            access_counts,
+            &declaration.key,
+            UnusedAccessKind::FunctionCall,
+        ) + access_count(
+            access_counts,
+            &declaration.key,
+            UnusedAccessKind::MethodCall,
+        ),
+        new_opcode_observed_count: access_count(
+            access_counts,
+            &declaration.key,
+            UnusedAccessKind::NewOpcodeObserved,
+        ),
+        fetch_observed_count: access_count(
+            access_counts,
+            &declaration.key,
+            UnusedAccessKind::GlobalConstantFetchObserved,
+        ) + access_count(
+            access_counts,
+            &declaration.key,
+            UnusedAccessKind::ClassConstantFetchObserved,
+        ),
+        read_observed_count: access_count(
+            access_counts,
+            &declaration.key,
+            UnusedAccessKind::GlobalConstantRead,
+        ) + access_count(
+            access_counts,
+            &declaration.key,
+            UnusedAccessKind::ClassConstantRead,
+        ),
+        defined_probe_count: access_count(
+            access_counts,
+            &declaration.key,
+            UnusedAccessKind::GlobalConstantProbe,
+        ) + access_count(
+            access_counts,
+            &declaration.key,
+            UnusedAccessKind::ClassConstantProbe,
+        ),
+        file_had_any_access,
+    }
+}
+
+fn sort_unused_rows(rows: &mut [UnusedReportRow]) {
+    rows.sort_by(|left, right| {
+        left.display_name
+            .cmp(&right.display_name)
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| left.start_line.cmp(&right.start_line))
+    });
+}
+
 fn transformed_values_for_run(
     connection: &Connection,
     run_id: i64,
@@ -1519,8 +2624,8 @@ fn trace_events_for_run(
         .query_map(params![run_id], |row| {
             let stack: String = row.get(16)?;
             let stack_json: String = row.get(17)?;
-            let stack_frames =
-                serde_json::from_str(&stack_json).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+            let stack_frames = serde_json::from_str(&stack_json)
+                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
             Ok(TraceEventReport {
                 event_index: row.get(0)?,
                 elapsed_ns: row.get(1)?,
@@ -1630,7 +2735,9 @@ fn render_trace_text(report: &TraceReport, color: bool) -> String {
     let _ = writeln!(
         out,
         "runs: {} | events: {} | transformed values: {}",
-        report.summary.run_count, report.summary.event_count, report.summary.transformed_value_count
+        report.summary.run_count,
+        report.summary.event_count,
+        report.summary.transformed_value_count
     );
 
     if report.runs.is_empty() {
@@ -1689,7 +2796,11 @@ fn render_trace_text(report: &TraceReport, color: bool) -> String {
         }
 
         if !run.transformed_values.is_empty() {
-            let _ = writeln!(out, "  Followed transformed values ({})", run.transformed_values.len());
+            let _ = writeln!(
+                out,
+                "  Followed transformed values ({})",
+                run.transformed_values.len()
+            );
             for value in &run.transformed_values {
                 let elapsed_ms = value.elapsed_ns as f64 / 1_000_000.0;
                 let _ = writeln!(
@@ -1712,7 +2823,13 @@ fn render_trace_text(report: &TraceReport, color: bool) -> String {
         let shown = run.events.len().min(50);
         let _ = writeln!(out, "  Events (showing {shown} of {})", run.events.len());
         for event in run.events.iter().take(shown) {
-            render_trace_event(&mut out, event, &run.trace_value, path_base.as_deref(), color);
+            render_trace_event(
+                &mut out,
+                event,
+                &run.trace_value,
+                path_base.as_deref(),
+                color,
+            );
         }
         if run.events.len() > shown {
             let _ = writeln!(out, "  ... {} more events", run.events.len() - shown);
@@ -1720,6 +2837,137 @@ fn render_trace_text(report: &TraceReport, color: bool) -> String {
     }
 
     out
+}
+
+fn render_unused_text(report: &UnusedReport, color: bool) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}",
+        ansi(color, "1", "Gameshark unused coverage report")
+    );
+    let _ = writeln!(
+        out,
+        "runs: {} | selected: {} | declarations: {} | access rows: {}",
+        report.summary.run_count,
+        report
+            .summary
+            .run_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "[none]".to_string()),
+        report.summary.declaration_count,
+        report.summary.access_count
+    );
+    let _ = writeln!(
+        out,
+        "uncalled functions: {} | uncalled concrete methods: {} | classes without new: {} | unread constants: {}/{}",
+        report.summary.uncalled_function_count,
+        report.summary.uncalled_concrete_method_count,
+        report.summary.class_without_new_count,
+        report.summary.global_constant_without_read_count,
+        report.summary.class_constant_without_read_count
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        ansi(
+            color,
+            "33",
+            "Caveat: no observed access in one runtime run is a coverage signal, not proof of dead code."
+        )
+    );
+
+    if let Some(run) = &report.run {
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "{} status={} sapi={} script={}",
+            ansi(color, "1", &format!("Run #{}", run.run_id)),
+            color_status(&run.status, color),
+            run.sapi,
+            run.script_filename.as_deref().unwrap_or("[unknown]")
+        );
+        if let Some(path) = run.request_path.as_deref() {
+            let _ = writeln!(out, "  request_path={}", ansi(color, "36", path));
+        }
+        if !run.caveats.is_empty() {
+            let _ = writeln!(out, "  caveats:");
+            for caveat in &run.caveats {
+                let _ = writeln!(out, "    {}", ansi(color, "33", caveat));
+            }
+        }
+    }
+
+    render_unused_section(
+        &mut out,
+        "Uncalled functions",
+        &report.uncalled_functions,
+        color,
+    );
+    render_unused_section(
+        &mut out,
+        "Uncalled concrete methods",
+        &report.uncalled_concrete_methods,
+        color,
+    );
+    render_unused_section(
+        &mut out,
+        "Classes with no new opcode observed",
+        &report.classes_with_no_new_opcode_observed,
+        color,
+    );
+    render_unused_section(
+        &mut out,
+        "Global constants without read observed",
+        &report.global_constants_without_read_observed,
+        color,
+    );
+    render_unused_section(
+        &mut out,
+        "Class constants without read observed",
+        &report.class_constants_without_read_observed,
+        color,
+    );
+
+    out
+}
+
+fn render_unused_section(out: &mut String, title: &str, rows: &[UnusedReportRow], color: bool) {
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{}",
+        ansi(color, "36", &format!("{title} ({})", rows.len()))
+    );
+    if rows.is_empty() {
+        let _ = writeln!(out, "  none");
+        return;
+    }
+
+    let shown = rows.len().min(50);
+    for row in rows.iter().take(shown) {
+        let location = format_location(row.file.as_deref(), row.start_line);
+        let peer = match row.file_had_any_access {
+            Some(true) => ansi(color, "32", "file-active"),
+            Some(false) => ansi(color, "2", "file-inactive"),
+            None => ansi(color, "2", "file-unknown"),
+        };
+        let _ = writeln!(
+            out,
+            "  {} {} calls={} new={} fetch={} read={} probes={} {}",
+            color_function_name(&row.display_name, color),
+            location,
+            row.call_count,
+            row.new_opcode_observed_count,
+            row.fetch_observed_count,
+            row.read_observed_count,
+            row.defined_probe_count,
+            peer
+        );
+    }
+    if rows.len() > shown {
+        let _ = writeln!(out, "  ... {} more", rows.len() - shown);
+    }
 }
 
 fn render_trace_event(
@@ -1742,7 +2990,14 @@ fn render_trace_event(
 
     if let Some(frames) = event.stack_frames.as_array() {
         if let Some(frame) = frames.first() {
-            render_immediate_frame(out, frame, &event.display_name, &event.matched_value, path_base, color);
+            render_immediate_frame(
+                out,
+                frame,
+                &event.display_name,
+                &event.matched_value,
+                path_base,
+                color,
+            );
             render_caller_frames(out, &frames[1..], &event.matched_value, path_base, color);
             return;
         }
@@ -1806,7 +3061,11 @@ fn render_caller_frames(
         let _ = writeln!(
             out,
             "      {}",
-            ansi(color, "2", &format!("... {} more caller frames", frames.len() - shown))
+            ansi(
+                color,
+                "2",
+                &format!("... {} more caller frames", frames.len() - shown)
+            )
         );
     }
 }
@@ -1835,7 +3094,11 @@ fn render_trace_event_fallback(
         let _ = writeln!(out, "    at: {location}");
     }
     for line in event.stack.iter().take(3) {
-        let _ = writeln!(out, "    {}", highlight_value(line, trace_value, 260, color));
+        let _ = writeln!(
+            out,
+            "    {}",
+            highlight_value(line, trace_value, 260, color)
+        );
     }
     if event.stack.len() > 3 {
         let _ = writeln!(out, "    ... {} more stack frames", event.stack.len() - 3);
@@ -1912,13 +3175,7 @@ fn format_immediate_arg(arg: &Value, trace_value: &str, color: bool) -> String {
     let value = format_preview_literal(preview, zval_type, trace_value, 180, color);
     let matches = format_match_details(arg, trace_value, 96, color);
 
-    format!(
-        "{}{} {}{}",
-        label,
-        color_syntax(":", color),
-        value,
-        matches
-    )
+    format!("{}{} {}{}", label, color_syntax(":", color), value, matches)
 }
 
 fn format_caller_arg(arg: &Value, trace_value: &str, color: bool) -> String {
@@ -2010,7 +3267,11 @@ fn format_match_details(arg: &Value, trace_value: &str, max_chars: usize, color:
     }
 
     if matches.len() > parts.len() {
-        parts.push(ansi(color, "2", &format!("+{} more", matches.len() - parts.len())));
+        parts.push(ansi(
+            color,
+            "2",
+            &format!("+{} more", matches.len() - parts.len()),
+        ));
     }
 
     format!(
@@ -2076,7 +3337,12 @@ fn format_preview_literal(
 ) -> String {
     let value = highlight_value(value, trace_value, max_chars, color);
     if zval_type == "string" {
-        format!("{}{}{}", color_syntax("\"", color), value, color_syntax("\"", color))
+        format!(
+            "{}{}{}",
+            color_syntax("\"", color),
+            value,
+            color_syntax("\"", color)
+        )
     } else {
         value
     }
@@ -2315,6 +3581,57 @@ fn identity_string(key: &FunctionKey) -> String {
         key.start_line,
         key.end_line
     )
+}
+
+fn unused_symbol_key(
+    kind: UnusedSymbolKind,
+    scope_name: Option<&str>,
+    name: &str,
+) -> UnusedSymbolKey {
+    let scope_name = scope_name
+        .map(normalize_class_like_name)
+        .filter(|value| !value.is_empty());
+    let name = match kind {
+        UnusedSymbolKind::Function
+        | UnusedSymbolKind::Method
+        | UnusedSymbolKind::Class
+        | UnusedSymbolKind::Closure => normalize_class_like_name(name),
+        UnusedSymbolKind::GlobalConstant | UnusedSymbolKind::ClassConstant => {
+            name.trim_start_matches('\\').to_string()
+        }
+    };
+    UnusedSymbolKey {
+        kind,
+        scope_name,
+        name,
+    }
+}
+
+fn normalize_class_like_name(value: &str) -> String {
+    value.trim_start_matches('\\').to_ascii_lowercase()
+}
+
+fn unused_display_name(kind: &UnusedSymbolKind, scope_name: Option<&str>, name: &str) -> String {
+    match (kind, scope_name) {
+        (UnusedSymbolKind::Method | UnusedSymbolKind::ClassConstant, Some(scope)) => {
+            format!(
+                "{}::{}",
+                scope.trim_start_matches('\\'),
+                name.trim_start_matches('\\')
+            )
+        }
+        _ => name.trim_start_matches('\\').to_string(),
+    }
+}
+
+fn unused_identity_hash(key: &UnusedSymbolKey) -> String {
+    let identity = format!(
+        "{}|{}|{}",
+        key.kind.as_str(),
+        key.scope_name.as_deref().unwrap_or(""),
+        key.name
+    );
+    fnv1a64_hex(identity.as_bytes())
 }
 
 fn fnv1a64_hex(bytes: &[u8]) -> String {

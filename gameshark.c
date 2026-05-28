@@ -4,8 +4,8 @@
 
 #include "php.h"
 
-#if PHP_VERSION_ID < 80000
-# error "gameshark requires PHP 8.0.0 or newer"
+#if PHP_VERSION_ID < 80200
+# error "gameshark requires PHP 8.2.0 or newer"
 #endif
 
 #ifdef PHP_WIN32
@@ -20,6 +20,7 @@
 #include "Zend/zend_smart_str.h"
 #include "Zend/zend_compile.h"
 #include "Zend/zend_execute.h"
+#include "Zend/zend_constants.h"
 #include "Zend/zend_stream.h"
 #include "php_gameshark.h"
 #include "gameshark_core.h"
@@ -68,11 +69,29 @@
 #define GAMESHARK_INVARIANT_RESOLVED_INTERNAL_METHOD 4
 #define GAMESHARK_INVARIANT_RESOLVED_UNSUPPORTED 5
 
+#define GAMESHARK_UNUSED_DECL_FUNCTION 1
+#define GAMESHARK_UNUSED_DECL_METHOD 2
+#define GAMESHARK_UNUSED_DECL_CLASS 3
+#define GAMESHARK_UNUSED_DECL_GLOBAL_CONSTANT 4
+#define GAMESHARK_UNUSED_DECL_CLASS_CONSTANT 5
+
+#define GAMESHARK_UNUSED_ACCESS_FUNCTION_CALL 1
+#define GAMESHARK_UNUSED_ACCESS_METHOD_CALL 2
+#define GAMESHARK_UNUSED_ACCESS_CLOSURE_CALL 3
+#define GAMESHARK_UNUSED_ACCESS_NEW_OPCODE 4
+#define GAMESHARK_UNUSED_ACCESS_GLOBAL_CONSTANT_FETCH 5
+#define GAMESHARK_UNUSED_ACCESS_CLASS_CONSTANT_FETCH 6
+#define GAMESHARK_UNUSED_ACCESS_GLOBAL_CONSTANT_READ 7
+#define GAMESHARK_UNUSED_ACCESS_CLASS_CONSTANT_READ 8
+#define GAMESHARK_UNUSED_ACCESS_GLOBAL_CONSTANT_PROBE 9
+#define GAMESHARK_UNUSED_ACCESS_CLASS_CONSTANT_PROBE 10
+
 PHP_FUNCTION(gameshark_loaded);
 PHP_FUNCTION(gameshark_side);
 PHP_FUNCTION(gameshark_db_path);
 PHP_FUNCTION(gameshark_compare);
 PHP_FUNCTION(gameshark_trace_report);
+PHP_FUNCTION(gameshark_unused_report);
 PHP_FUNCTION(gameshark_invariants_status);
 
 typedef struct {
@@ -140,6 +159,7 @@ static bool gameshark_invariants_enabled = false;
 static bool gameshark_invariants_loaded = false;
 static bool gameshark_invariants_active = false;
 static bool gameshark_invariants_executing_hook = false;
+static bool gameshark_unused_active = false;
 static char *gameshark_request_side = NULL;
 static char *gameshark_request_db_path = NULL;
 static char *gameshark_invariants_file = NULL;
@@ -172,6 +192,10 @@ static uint64_t gameshark_invariant_internal_hook_exceptions = 0;
 static bool gameshark_execute_internal_previous_present = false;
 static void (*gameshark_original_execute_ex)(zend_execute_data *execute_data) = NULL;
 static void (*gameshark_original_execute_internal)(zend_execute_data *execute_data, zval *return_value) = NULL;
+static bool gameshark_new_opcode_handler_owned = false;
+static bool gameshark_constant_opcode_handler_owned = false;
+static bool gameshark_class_constant_opcode_handler_owned = false;
+static bool gameshark_defined_opcode_handler_owned = false;
 
 static bool gameshark_numeric_matches_long(zend_long value);
 static bool gameshark_numeric_matches_double(double value);
@@ -195,6 +219,11 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_gameshark_trace_report, 0, 0, MA
 	ZEND_ARG_TYPE_INFO(0, format, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_gameshark_unused_report, 0, 0, MAY_BE_ARRAY | MAY_BE_STRING)
+	ZEND_ARG_TYPE_INFO(0, format, IS_STRING, 0)
+	ZEND_ARG_TYPE_INFO(0, run_id, IS_LONG, 1)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_gameshark_invariants_status, 0, 0, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
@@ -204,6 +233,7 @@ static const zend_function_entry gameshark_functions[] = {
 	PHP_FE(gameshark_db_path, arginfo_gameshark_db_path)
 	PHP_FE(gameshark_compare, arginfo_gameshark_compare)
 	PHP_FE(gameshark_trace_report, arginfo_gameshark_trace_report)
+	PHP_FE(gameshark_unused_report, arginfo_gameshark_unused_report)
 	PHP_FE(gameshark_invariants_status, arginfo_gameshark_invariants_status)
 	PHP_FE_END
 };
@@ -213,6 +243,8 @@ PHP_INI_BEGIN()
 	PHP_INI_ENTRY("gameshark.invariants", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
 	PHP_INI_ENTRY("gameshark.invariants_file", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
 	PHP_INI_ENTRY("gameshark.invariants_warn_builtins", "1", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
+	PHP_INI_ENTRY("gameshark.unused", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
+	PHP_INI_ENTRY("gameshark.unused_capture_query", "0", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
 PHP_INI_END()
 
 static gameshark_core_str gameshark_zstr_to_core_str(zend_string *string)
@@ -277,6 +309,118 @@ static gameshark_core_function_meta gameshark_function_meta(zend_function *funct
 		start_line,
 		end_line,
 	};
+}
+
+static bool gameshark_unused_file_is_invariant(zend_string *file)
+{
+	if (file == NULL || gameshark_invariants_file == NULL) {
+		return false;
+	}
+	return ZSTR_LEN(file) == strlen(gameshark_invariants_file) &&
+		memcmp(ZSTR_VAL(file), gameshark_invariants_file, ZSTR_LEN(file)) == 0;
+}
+
+static void gameshark_unused_record_declaration(
+	uint8_t kind,
+	zend_string *scope_name,
+	zend_string *name,
+	zend_string *file,
+	uint32_t start_line,
+	uint32_t end_line,
+	uint32_t flags
+) {
+	if (!gameshark_unused_active || name == NULL || ZSTR_LEN(name) == 0 || gameshark_unused_file_is_invariant(file)) {
+		return;
+	}
+
+	gameshark_core_unused_declaration declaration = {
+		kind,
+		gameshark_zstr_to_core_str(scope_name),
+		gameshark_zstr_to_core_str(name),
+		gameshark_zstr_to_core_str(file),
+		start_line,
+		end_line,
+		flags,
+	};
+	gameshark_core_record_unused_declaration(&declaration);
+}
+
+static void gameshark_unused_record_access(
+	uint8_t kind,
+	zend_string *scope_name,
+	zend_string *name,
+	zend_string *file,
+	uint32_t start_line,
+	uint32_t end_line
+) {
+	if (!gameshark_unused_active || name == NULL || ZSTR_LEN(name) == 0 || gameshark_unused_file_is_invariant(file)) {
+		return;
+	}
+
+	gameshark_core_unused_access access = {
+		kind,
+		gameshark_zstr_to_core_str(scope_name),
+		gameshark_zstr_to_core_str(name),
+		gameshark_zstr_to_core_str(file),
+		start_line,
+		end_line,
+	};
+	gameshark_core_record_unused_access(&access);
+}
+
+static void gameshark_unused_record_access_mem(
+	uint8_t kind,
+	const char *scope_name,
+	size_t scope_name_len,
+	const char *name,
+	size_t name_len
+) {
+	if (!gameshark_unused_active || name == NULL || name_len == 0) {
+		return;
+	}
+
+	gameshark_core_unused_access access = {
+		kind,
+		gameshark_mem_to_core_str(scope_name, scope_name_len),
+		gameshark_mem_to_core_str(name, name_len),
+		{NULL, 0},
+		0,
+		0,
+	};
+	gameshark_core_record_unused_access(&access);
+}
+
+static void gameshark_unused_record_caveat(const char *caveat)
+{
+	if (gameshark_unused_active && caveat != NULL) {
+		gameshark_core_record_unused_caveat(caveat);
+	}
+}
+
+static void gameshark_unused_record_call(gameshark_core_function_meta *meta)
+{
+	if (!gameshark_unused_active || meta == NULL || meta->function_name.ptr == NULL || meta->function_name.len == 0) {
+		return;
+	}
+
+	uint8_t access_kind = GAMESHARK_UNUSED_ACCESS_FUNCTION_CALL;
+	if (meta->kind == GAMESHARK_KIND_METHOD) {
+		access_kind = GAMESHARK_UNUSED_ACCESS_METHOD_CALL;
+	} else if (meta->kind == GAMESHARK_KIND_CLOSURE) {
+		access_kind = GAMESHARK_UNUSED_ACCESS_CLOSURE_CALL;
+	} else if (meta->kind != GAMESHARK_KIND_FUNCTION) {
+		return;
+	}
+
+	gameshark_core_unused_access access = {
+		access_kind,
+		meta->scope_name,
+		meta->function_name,
+		meta->file,
+		meta->start_line,
+		meta->end_line,
+	};
+	gameshark_core_record_unused_access(&access);
 }
 
 static zend_string *gameshark_trace_canonical_function_name(zend_function *function)
@@ -2450,6 +2594,10 @@ static void gameshark_observer_begin(zend_execute_data *execute_data)
 		gameshark_core_record_call(&meta);
 	}
 
+	if (gameshark_unused_active && function->type == ZEND_USER_FUNCTION) {
+		gameshark_unused_record_call(&meta);
+	}
+
 	if (gameshark_trace_active) {
 		if (gameshark_trace_filter_active) {
 			zend_string *canonical_name = gameshark_trace_canonical_function_name(function);
@@ -2492,6 +2640,235 @@ static void gameshark_observer_end(zend_execute_data *execute_data, zval *retval
 	}
 }
 
+static void gameshark_unused_function_declared(zend_op_array *op_array, zend_string *name)
+{
+	if (!gameshark_unused_active || op_array == NULL || name == NULL || (op_array->fn_flags & ZEND_ACC_CLOSURE)) {
+		return;
+	}
+	gameshark_unused_record_declaration(
+		GAMESHARK_UNUSED_DECL_FUNCTION,
+		NULL,
+		name,
+		op_array->filename,
+		op_array->line_start,
+		op_array->line_end,
+		op_array->fn_flags
+	);
+}
+
+static void gameshark_unused_class_linked(zend_class_entry *ce, zend_string *name)
+{
+	(void) name;
+	if (!gameshark_unused_active || ce == NULL || ce->type != ZEND_USER_CLASS || ce->name == NULL) {
+		return;
+	}
+
+	if (ce->ce_flags & ZEND_ACC_ANON_CLASS) {
+		return;
+	}
+
+	zend_string *file = ce->info.user.filename;
+	if (gameshark_unused_file_is_invariant(file)) {
+		return;
+	}
+
+	gameshark_unused_record_declaration(
+		GAMESHARK_UNUSED_DECL_CLASS,
+		NULL,
+		ce->name,
+		file,
+		ce->info.user.line_start,
+		ce->info.user.line_end,
+		ce->ce_flags
+	);
+
+	zend_function *method;
+	ZEND_HASH_MAP_FOREACH_PTR(&ce->function_table, method) {
+		if (method == NULL ||
+			method->type != ZEND_USER_FUNCTION ||
+			method->common.scope != ce ||
+			method->common.function_name == NULL) {
+			continue;
+		}
+		gameshark_unused_record_declaration(
+			GAMESHARK_UNUSED_DECL_METHOD,
+			ce->name,
+			method->common.function_name,
+			method->op_array.filename,
+			method->op_array.line_start,
+			method->op_array.line_end,
+			method->common.fn_flags
+		);
+	} ZEND_HASH_FOREACH_END();
+
+	zend_string *constant_name;
+	zval *constant_zv;
+	ZEND_HASH_MAP_FOREACH_STR_KEY_VAL(&ce->constants_table, constant_name, constant_zv) {
+		if (constant_name == NULL || Z_TYPE_P(constant_zv) != IS_PTR) {
+			continue;
+		}
+		zend_class_constant *constant = (zend_class_constant *) Z_PTR_P(constant_zv);
+		if (constant == NULL || constant->ce != ce || (ZEND_CLASS_CONST_FLAGS(constant) & ZEND_CLASS_CONST_IS_CASE)) {
+			continue;
+		}
+		gameshark_unused_record_declaration(
+			GAMESHARK_UNUSED_DECL_CLASS_CONSTANT,
+			ce->name,
+			constant_name,
+			file,
+			ce->info.user.line_start,
+			ce->info.user.line_end,
+			ZEND_CLASS_CONST_FLAGS(constant)
+		);
+	} ZEND_HASH_FOREACH_END();
+}
+
+static void gameshark_unused_record_global_constants(void)
+{
+	if (!gameshark_unused_active) {
+		return;
+	}
+
+	zend_constant *constant;
+	ZEND_HASH_MAP_FOREACH_PTR(EG(zend_constants), constant) {
+		if (constant == NULL ||
+			constant->name == NULL ||
+			ZEND_CONSTANT_MODULE_NUMBER(constant) != PHP_USER_CONSTANT) {
+			continue;
+		}
+		gameshark_unused_record_declaration(
+			GAMESHARK_UNUSED_DECL_GLOBAL_CONSTANT,
+			NULL,
+			constant->name,
+			constant->filename,
+			0,
+			0,
+			ZEND_CONSTANT_FLAGS(constant)
+		);
+	} ZEND_HASH_FOREACH_END();
+}
+
+static void gameshark_unused_record_constant_name(zend_string *name, uint8_t global_kind, uint8_t class_kind)
+{
+	if (!gameshark_unused_active || name == NULL || ZSTR_LEN(name) == 0) {
+		return;
+	}
+
+	const char *separator = gameshark_find_bytes(ZSTR_VAL(name), ZSTR_LEN(name), "::", 2);
+	if (separator != NULL && separator > ZSTR_VAL(name) && (separator + 2) < (ZSTR_VAL(name) + ZSTR_LEN(name))) {
+		size_t scope_len = (size_t)(separator - ZSTR_VAL(name));
+		const char *constant_name = separator + 2;
+		size_t constant_name_len = ZSTR_LEN(name) - scope_len - 2;
+		gameshark_unused_record_access_mem(class_kind, ZSTR_VAL(name), scope_len, constant_name, constant_name_len);
+		return;
+	}
+
+	gameshark_unused_record_access(global_kind, NULL, name, NULL, 0, 0);
+}
+
+static int gameshark_unused_new_opcode_handler(zend_execute_data *execute_data)
+{
+	if (!gameshark_unused_active || execute_data == NULL || execute_data->opline == NULL) {
+		return ZEND_USER_OPCODE_DISPATCH;
+	}
+
+	const zend_op *opline = execute_data->opline;
+	if (opline->op1_type == IS_CONST) {
+		zval *class_zv = RT_CONSTANT(opline, opline->op1);
+		if (Z_TYPE_P(class_zv) == IS_STRING) {
+			gameshark_unused_record_access(GAMESHARK_UNUSED_ACCESS_NEW_OPCODE, NULL, Z_STR_P(class_zv), NULL, 0, 0);
+		} else {
+			gameshark_unused_record_caveat("new opcode target was not a string constant");
+		}
+	} else {
+		gameshark_unused_record_caveat("dynamic or special new opcode target skipped");
+	}
+
+	return ZEND_USER_OPCODE_DISPATCH;
+}
+
+static int gameshark_unused_constant_opcode_handler(zend_execute_data *execute_data)
+{
+	if (!gameshark_unused_active || execute_data == NULL || execute_data->opline == NULL) {
+		return ZEND_USER_OPCODE_DISPATCH;
+	}
+
+	const zend_op *opline = execute_data->opline;
+	if (opline->op2_type == IS_CONST) {
+		zval *constant_zv = RT_CONSTANT(opline, opline->op2);
+		if (Z_TYPE_P(constant_zv) == IS_STRING) {
+			gameshark_unused_record_access(
+				GAMESHARK_UNUSED_ACCESS_GLOBAL_CONSTANT_FETCH,
+				NULL,
+				Z_STR_P(constant_zv),
+				NULL,
+				0,
+				0
+			);
+		} else {
+			gameshark_unused_record_caveat("global constant fetch target was not a string constant");
+		}
+	} else {
+		gameshark_unused_record_caveat("dynamic global constant fetch target skipped");
+	}
+
+	return ZEND_USER_OPCODE_DISPATCH;
+}
+
+static int gameshark_unused_class_constant_opcode_handler(zend_execute_data *execute_data)
+{
+	if (!gameshark_unused_active || execute_data == NULL || execute_data->opline == NULL) {
+		return ZEND_USER_OPCODE_DISPATCH;
+	}
+
+	const zend_op *opline = execute_data->opline;
+	if (opline->op1_type == IS_CONST && opline->op2_type == IS_CONST) {
+		zval *class_zv = RT_CONSTANT(opline, opline->op1);
+		zval *constant_zv = RT_CONSTANT(opline, opline->op2);
+		if (Z_TYPE_P(class_zv) == IS_STRING && Z_TYPE_P(constant_zv) == IS_STRING) {
+			gameshark_unused_record_access(
+				GAMESHARK_UNUSED_ACCESS_CLASS_CONSTANT_FETCH,
+				Z_STR_P(class_zv),
+				Z_STR_P(constant_zv),
+				NULL,
+				0,
+				0
+			);
+		} else {
+			gameshark_unused_record_caveat("class constant fetch target was not fully string constant");
+		}
+	} else {
+		gameshark_unused_record_caveat("dynamic or special class constant fetch target skipped");
+	}
+
+	return ZEND_USER_OPCODE_DISPATCH;
+}
+
+static int gameshark_unused_defined_opcode_handler(zend_execute_data *execute_data)
+{
+	if (!gameshark_unused_active || execute_data == NULL || execute_data->opline == NULL) {
+		return ZEND_USER_OPCODE_DISPATCH;
+	}
+
+	const zend_op *opline = execute_data->opline;
+	if (opline->op1_type == IS_CONST) {
+		zval *constant_zv = RT_CONSTANT(opline, opline->op1);
+		if (Z_TYPE_P(constant_zv) == IS_STRING) {
+			gameshark_unused_record_constant_name(
+				Z_STR_P(constant_zv),
+				GAMESHARK_UNUSED_ACCESS_GLOBAL_CONSTANT_PROBE,
+				GAMESHARK_UNUSED_ACCESS_CLASS_CONSTANT_PROBE
+			);
+		} else {
+			gameshark_unused_record_caveat("defined opcode target was not a string constant");
+		}
+	} else {
+		gameshark_unused_record_caveat("dynamic defined opcode target skipped");
+	}
+
+	return ZEND_USER_OPCODE_DISPATCH;
+}
+
 static zend_observer_fcall_handlers gameshark_observer_fcall_init(zend_execute_data *execute_data)
 {
 	zend_function *function = execute_data->func;
@@ -2514,9 +2891,9 @@ static zend_observer_fcall_handlers gameshark_observer_fcall_init(zend_execute_d
 		}
 	}
 
-	if ((gameshark_count_active && function->type == ZEND_USER_FUNCTION) || gameshark_trace_active || wants_invariant_end) {
+	if (((gameshark_count_active || gameshark_unused_active) && function->type == ZEND_USER_FUNCTION) || gameshark_trace_active || wants_invariant_end) {
 		return (zend_observer_fcall_handlers){
-			((gameshark_count_active && function->type == ZEND_USER_FUNCTION) || gameshark_trace_active) ? gameshark_observer_begin : NULL,
+			(((gameshark_count_active || gameshark_unused_active) && function->type == ZEND_USER_FUNCTION) || gameshark_trace_active) ? gameshark_observer_begin : NULL,
 			(gameshark_trace_follow_transforms || wants_invariant_end) ? gameshark_observer_end : NULL
 		};
 	}
@@ -2561,6 +2938,54 @@ static void gameshark_call_original_execute_internal(zend_execute_data *execute_
 	execute_data->func->internal_function.handler(execute_data, return_value);
 }
 
+static bool gameshark_unused_internal_function_supported(zend_function *function)
+{
+	if (!gameshark_unused_active ||
+		gameshark_invariants_executing_hook ||
+		function == NULL ||
+		function->type != ZEND_INTERNAL_FUNCTION ||
+		function->common.scope != NULL ||
+		function->common.function_name == NULL) {
+		return false;
+	}
+
+	return zend_string_equals_literal(function->common.function_name, "constant") ||
+		zend_string_equals_literal(function->common.function_name, "defined");
+}
+
+static void gameshark_unused_observe_internal(zend_execute_data *execute_data, zval *return_value)
+{
+	zend_function *function = execute_data != NULL ? execute_data->func : NULL;
+	if (!gameshark_unused_internal_function_supported(function) || EG(exception) || return_value == NULL || Z_TYPE_P(return_value) == IS_UNDEF) {
+		return;
+	}
+	if (ZEND_CALL_NUM_ARGS(execute_data) < 1) {
+		return;
+	}
+
+	zval *argument = ZEND_CALL_ARG(execute_data, 1);
+	if (Z_TYPE_P(argument) != IS_STRING) {
+		return;
+	}
+
+	if (zend_string_equals_literal(function->common.function_name, "defined")) {
+		if (Z_TYPE_P(return_value) == IS_TRUE) {
+			gameshark_unused_record_constant_name(
+				Z_STR_P(argument),
+				GAMESHARK_UNUSED_ACCESS_GLOBAL_CONSTANT_PROBE,
+				GAMESHARK_UNUSED_ACCESS_CLASS_CONSTANT_PROBE
+			);
+		}
+		return;
+	}
+
+	gameshark_unused_record_constant_name(
+		Z_STR_P(argument),
+		GAMESHARK_UNUSED_ACCESS_GLOBAL_CONSTANT_READ,
+		GAMESHARK_UNUSED_ACCESS_CLASS_CONSTANT_READ
+	);
+}
+
 static void gameshark_execute_internal(zend_execute_data *execute_data, zval *return_value)
 {
 	zend_function *function = execute_data != NULL ? execute_data->func : NULL;
@@ -2568,6 +2993,7 @@ static void gameshark_execute_internal(zend_execute_data *execute_data, zval *re
 		!gameshark_invariant_has_internal_hooks ||
 		!gameshark_invariant_internal_function_supported(function)) {
 		gameshark_call_original_execute_internal(execute_data, return_value);
+		gameshark_unused_observe_internal(execute_data, return_value);
 		return;
 	}
 
@@ -2581,6 +3007,7 @@ static void gameshark_execute_internal(zend_execute_data *execute_data, zval *re
 	zend_string *match_key = gameshark_invariant_function_match_key(function, &target_kind);
 	if (match_key == NULL) {
 		gameshark_call_original_execute_internal(execute_data, return_value);
+		gameshark_unused_observe_internal(execute_data, return_value);
 		return;
 	}
 
@@ -2589,6 +3016,7 @@ static void gameshark_execute_internal(zend_execute_data *execute_data, zval *re
 	if (!has_pre_hook && !has_post_hook) {
 		zend_string_release(match_key);
 		gameshark_call_original_execute_internal(execute_data, return_value);
+		gameshark_unused_observe_internal(execute_data, return_value);
 		return;
 	}
 
@@ -2627,6 +3055,8 @@ static void gameshark_execute_internal(zend_execute_data *execute_data, zval *re
 		return;
 	}
 
+	gameshark_unused_observe_internal(execute_data, return_value);
+
 	if (has_post_hook && return_value != NULL && Z_TYPE_P(return_value) != IS_UNDEF) {
 		gameshark_run_post_invariants_for_frame(match_key, target_kind, resolved_kind, &frame, return_value);
 	}
@@ -2645,6 +3075,24 @@ PHP_MINIT_FUNCTION(gameshark)
 {
 	if (type != MODULE_TEMPORARY) {
 		zend_observer_fcall_register(gameshark_observer_fcall_init);
+		zend_observer_function_declared_register(gameshark_unused_function_declared);
+		zend_observer_class_linked_register(gameshark_unused_class_linked);
+	}
+	if (zend_get_user_opcode_handler(ZEND_NEW) == NULL &&
+		zend_set_user_opcode_handler(ZEND_NEW, gameshark_unused_new_opcode_handler) == SUCCESS) {
+		gameshark_new_opcode_handler_owned = true;
+	}
+	if (zend_get_user_opcode_handler(ZEND_FETCH_CONSTANT) == NULL &&
+		zend_set_user_opcode_handler(ZEND_FETCH_CONSTANT, gameshark_unused_constant_opcode_handler) == SUCCESS) {
+		gameshark_constant_opcode_handler_owned = true;
+	}
+	if (zend_get_user_opcode_handler(ZEND_FETCH_CLASS_CONSTANT) == NULL &&
+		zend_set_user_opcode_handler(ZEND_FETCH_CLASS_CONSTANT, gameshark_unused_class_constant_opcode_handler) == SUCCESS) {
+		gameshark_class_constant_opcode_handler_owned = true;
+	}
+	if (zend_get_user_opcode_handler(ZEND_DEFINED) == NULL &&
+		zend_set_user_opcode_handler(ZEND_DEFINED, gameshark_unused_defined_opcode_handler) == SUCCESS) {
+		gameshark_defined_opcode_handler_owned = true;
 	}
 	gameshark_original_execute_ex = zend_execute_ex;
 	zend_execute_ex = gameshark_execute_ex;
@@ -2657,6 +3105,22 @@ PHP_MINIT_FUNCTION(gameshark)
 
 PHP_MSHUTDOWN_FUNCTION(gameshark)
 {
+	if (gameshark_new_opcode_handler_owned && zend_get_user_opcode_handler(ZEND_NEW) == gameshark_unused_new_opcode_handler) {
+		zend_set_user_opcode_handler(ZEND_NEW, NULL);
+	}
+	gameshark_new_opcode_handler_owned = false;
+	if (gameshark_constant_opcode_handler_owned && zend_get_user_opcode_handler(ZEND_FETCH_CONSTANT) == gameshark_unused_constant_opcode_handler) {
+		zend_set_user_opcode_handler(ZEND_FETCH_CONSTANT, NULL);
+	}
+	gameshark_constant_opcode_handler_owned = false;
+	if (gameshark_class_constant_opcode_handler_owned && zend_get_user_opcode_handler(ZEND_FETCH_CLASS_CONSTANT) == gameshark_unused_class_constant_opcode_handler) {
+		zend_set_user_opcode_handler(ZEND_FETCH_CLASS_CONSTANT, NULL);
+	}
+	gameshark_class_constant_opcode_handler_owned = false;
+	if (gameshark_defined_opcode_handler_owned && zend_get_user_opcode_handler(ZEND_DEFINED) == gameshark_unused_defined_opcode_handler) {
+		zend_set_user_opcode_handler(ZEND_DEFINED, NULL);
+	}
+	gameshark_defined_opcode_handler_owned = false;
 	if (zend_execute_ex == gameshark_execute_ex && gameshark_original_execute_ex != NULL) {
 		zend_execute_ex = gameshark_original_execute_ex;
 	}
@@ -2688,6 +3152,10 @@ PHP_RINIT_FUNCTION(gameshark)
 	const char *invariants_env = getenv("GAMESHARK_INVARIANTS");
 	const char *invariants_file_env = getenv("GAMESHARK_INVARIANTS_FILE");
 	const char *invariants_warn_builtins_env = getenv("GAMESHARK_INVARIANTS_WARN_BUILTINS");
+	const char *unused_ini = zend_ini_string_literal("gameshark.unused");
+	const char *unused_capture_query_ini = zend_ini_string_literal("gameshark.unused_capture_query");
+	const char *unused_env = getenv("GAMESHARK_UNUSED");
+	const char *unused_capture_query_env = getenv("GAMESHARK_UNUSED_CAPTURE_QUERY");
 	bool valid_side = side != NULL && (strcmp(side, "left") == 0 || strcmp(side, "right") == 0);
 	bool wants_trace = trace_value != NULL && trace_value[0] != '\0';
 	const char *trace_allow_pattern = gameshark_config_has_value(trace_allow_pattern_ini)
@@ -2696,6 +3164,12 @@ PHP_RINIT_FUNCTION(gameshark)
 	bool wants_invariants = invariants_ini != NULL && invariants_ini[0] != '\0'
 		? gameshark_config_truthy(invariants_ini)
 		: gameshark_config_truthy(invariants_env);
+	bool wants_unused = unused_ini != NULL && unused_ini[0] != '\0'
+		? gameshark_config_truthy(unused_ini)
+		: gameshark_config_truthy(unused_env);
+	bool unused_capture_query = gameshark_config_has_value(unused_capture_query_env)
+		? gameshark_config_truthy(unused_capture_query_env)
+		: gameshark_config_truthy(unused_capture_query_ini);
 	const char *invariants_file = invariants_file_ini != NULL && invariants_file_ini[0] != '\0'
 		? invariants_file_ini
 		: invariants_file_env;
@@ -2703,6 +3177,7 @@ PHP_RINIT_FUNCTION(gameshark)
 	gameshark_request_active = false;
 	gameshark_count_active = false;
 	gameshark_trace_active = false;
+	gameshark_unused_active = false;
 	gameshark_request_db_path = NULL;
 	gameshark_request_side = NULL;
 	gameshark_reset_trace_config();
@@ -2722,7 +3197,7 @@ PHP_RINIT_FUNCTION(gameshark)
 		}
 	}
 
-	if (db_path == NULL || db_path[0] == '\0' || (!valid_side && !wants_trace)) {
+	if (db_path == NULL || db_path[0] == '\0' || (!valid_side && !wants_trace && !wants_unused)) {
 		return SUCCESS;
 	}
 
@@ -2736,19 +3211,56 @@ PHP_RINIT_FUNCTION(gameshark)
 		script_filename = SG(request_info).request_uri;
 	}
 
+	const char *request_uri = SG(request_info).request_uri;
+	const char *query_string = SG(request_info).query_string;
+	char *request_path = NULL;
+	char *request_uri_full = NULL;
+	if (request_uri != NULL && request_uri[0] != '\0') {
+		const char *query_start = strchr(request_uri, '?');
+		if (query_start != NULL) {
+			request_path = estrndup(request_uri, (size_t)(query_start - request_uri));
+		} else {
+			request_path = estrdup(request_uri);
+		}
+		if (unused_capture_query) {
+			if (query_start != NULL || query_string == NULL || query_string[0] == '\0') {
+				request_uri_full = estrdup(request_uri);
+			} else {
+				size_t request_uri_len = strlen(request_uri);
+				size_t query_string_len = strlen(query_string);
+				request_uri_full = emalloc(request_uri_len + query_string_len + 2);
+				memcpy(request_uri_full, request_uri, request_uri_len);
+				request_uri_full[request_uri_len] = '?';
+				memcpy(request_uri_full + request_uri_len + 1, query_string, query_string_len);
+				request_uri_full[request_uri_len + query_string_len + 1] = '\0';
+			}
+		}
+	}
+
 	if (gameshark_core_request_start(
 		db_path,
 		valid_side ? side : NULL,
 		wants_trace ? trace_value : NULL,
 		wants_trace && gameshark_config_has_value(trace_allow_pattern) ? trace_allow_pattern : NULL,
-		PHP_VERSION,
-		sapi_module.name,
-		(uint32_t)getpid(),
-		script_filename
+			PHP_VERSION,
+			sapi_module.name,
+			(uint32_t)getpid(),
+			script_filename,
+			wants_unused ? 1 : 0,
+			request_path,
+			request_uri_full,
+			unused_capture_query ? query_string : NULL,
+			gameshark_new_opcode_handler_owned ? 1 : 0,
+			gameshark_constant_opcode_handler_owned ? 1 : 0,
+			gameshark_class_constant_opcode_handler_owned ? 1 : 0
 	)) {
 		gameshark_request_active = true;
 		gameshark_count_active = valid_side;
 		gameshark_trace_active = wants_trace;
+		gameshark_unused_active = wants_unused;
+		if (gameshark_unused_active && !gameshark_defined_opcode_handler_owned) {
+			gameshark_unused_record_caveat("ZEND_DEFINED opcode handler unavailable because another extension already registered one");
+		}
 		gameshark_trace_filter_active = wants_trace && gameshark_config_has_value(trace_allow_pattern);
 		if (gameshark_trace_filter_active) {
 			char *trace_filter_error = gameshark_core_trace_filter_error();
@@ -2771,12 +3283,20 @@ PHP_RINIT_FUNCTION(gameshark)
 		}
 	}
 
+	if (request_path != NULL) {
+		efree(request_path);
+	}
+	if (request_uri_full != NULL) {
+		efree(request_uri_full);
+	}
+
 	return SUCCESS;
 }
 
 PHP_RSHUTDOWN_FUNCTION(gameshark)
 {
 	if (gameshark_request_active) {
+		gameshark_unused_record_global_constants();
 		gameshark_core_request_finish();
 	}
 
@@ -2793,6 +3313,7 @@ PHP_RSHUTDOWN_FUNCTION(gameshark)
 	gameshark_request_active = false;
 	gameshark_count_active = false;
 	gameshark_trace_active = false;
+	gameshark_unused_active = false;
 
 	return SUCCESS;
 }
@@ -3025,6 +3546,43 @@ PHP_FUNCTION(gameshark_trace_report)
 	}
 
 	char *json = gameshark_core_trace_report_json(db_path);
+	if (report_format == GAMESHARK_REPORT_JSON) {
+		gameshark_return_json_report(INTERNAL_FUNCTION_PARAM_PASSTHRU, json);
+		return;
+	}
+	gameshark_decode_json_report(INTERNAL_FUNCTION_PARAM_PASSTHRU, json);
+}
+
+PHP_FUNCTION(gameshark_unused_report)
+{
+	char *format = NULL;
+	size_t format_len = 0;
+	zend_long run_id = -1;
+	bool run_id_is_null = true;
+
+	ZEND_PARSE_PARAMETERS_START(0, 2)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_STRING(format, format_len)
+		Z_PARAM_LONG_OR_NULL(run_id, run_id_is_null)
+	ZEND_PARSE_PARAMETERS_END();
+
+	int report_format = gameshark_report_format(format, format_len);
+	if (report_format < 0) {
+		RETURN_THROWS();
+	}
+
+	const char *db_path = gameshark_request_db_path;
+	if (db_path == NULL || db_path[0] == '\0') {
+		db_path = getenv("GAMESHARK_DB");
+	}
+
+	int64_t selected_run_id = run_id_is_null ? -1 : (int64_t)run_id;
+	if (report_format == GAMESHARK_REPORT_TEXT) {
+		gameshark_return_text_report(INTERNAL_FUNCTION_PARAM_PASSTHRU, gameshark_core_unused_report_text(db_path, gameshark_report_color_enabled() ? 1 : 0, selected_run_id));
+		return;
+	}
+
+	char *json = gameshark_core_unused_report_json(db_path, selected_run_id);
 	if (report_format == GAMESHARK_REPORT_JSON) {
 		gameshark_return_json_report(INTERNAL_FUNCTION_PARAM_PASSTHRU, json);
 		return;

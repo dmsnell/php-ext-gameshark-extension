@@ -3,7 +3,7 @@
 ## Requirements
 
 - Linux or macOS.
-- PHP 8.0 or newer, non-ZTS.
+- PHP 8.2 or newer, non-ZTS.
 - `phpize` and `php-config` for the PHP binary that will load the extension.
 - Rust and `cargo`.
 
@@ -80,4 +80,3 @@ PHP_CONFIG=/path/to/php-config scripts/package-binary-unix.sh
 The artifact contains `gameshark.so`, `manifest.json`, `README-install.md`,
 and checksum files. It is only safe for a PHP installation with the same ABI
 metadata recorded in the manifest.
-
