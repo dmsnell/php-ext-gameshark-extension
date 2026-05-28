@@ -2,6 +2,7 @@
 /aclocal.m4
 /autom4te.cache/
 /build/
+/dist/
 /config.cache
 /config.guess
 /config.h
@@ -11,7 +12,9 @@
 /config.status
 /config.sub
 /configure
+/configure~
 /configure.ac
+/config.h.in~
 /include/
 /install-sh
 /libtool

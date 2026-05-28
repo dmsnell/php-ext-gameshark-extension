@@ -18,17 +18,49 @@ typedef struct {
 	uint32_t end_line;
 } gameshark_core_function_meta;
 
+typedef struct {
+	gameshark_core_function_meta function;
+	gameshark_core_str argument_path;
+	gameshark_core_str zval_type;
+	uint32_t matched_value_id;
+	uint8_t match_kind;
+	gameshark_core_str matched_value;
+	gameshark_core_str preview;
+	gameshark_core_str observed_value;
+	gameshark_core_str stack;
+	gameshark_core_str stack_json;
+} gameshark_core_trace_event;
+
+typedef struct {
+	uint32_t value_id;
+	uint32_t parent_value_id;
+	gameshark_core_function_meta function;
+	gameshark_core_str transform_kind;
+	gameshark_core_str value;
+	gameshark_core_str preview;
+} gameshark_core_transformed_value;
+
 int gameshark_core_request_start(
 	const char *db_path,
 	const char *side,
+	const char *trace_value,
+	const char *trace_allow_pattern,
 	const char *php_version,
 	const char *sapi_name,
 	uint32_t pid,
 	const char *script_filename
 );
 void gameshark_core_record_call(const gameshark_core_function_meta *meta);
+int gameshark_core_trace_filter_allows(const char *canonical_name);
+void gameshark_core_trace_filter_record_argument_result(int matched, int transform_frame_started);
+char *gameshark_core_trace_filter_error(void);
+void gameshark_core_record_trace_event(const gameshark_core_trace_event *event);
+void gameshark_core_record_transformed_value(const gameshark_core_transformed_value *value);
 void gameshark_core_request_finish(void);
 char *gameshark_core_compare_json(const char *db_path);
+char *gameshark_core_compare_text(const char *db_path, int color);
+char *gameshark_core_trace_report_json(const char *db_path);
+char *gameshark_core_trace_report_text(const char *db_path, int color);
 void gameshark_core_string_free(char *ptr);
 
 #endif

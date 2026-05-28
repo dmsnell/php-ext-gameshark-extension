@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.0"
+  xmlns="http://pear.php.net/dtd/package-2.0"
+  xmlns:tasks="http://pear.php.net/dtd/tasks-1.0"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://pear.php.net/dtd/tasks-1.0 http://pear.php.net/dtd/tasks-1.0.xsd http://pear.php.net/dtd/package-2.0 http://pear.php.net/dtd/package-2.0.xsd">
+  <name>gameshark</name>
+  <channel>pecl.php.net</channel>
+  <summary>SQLite-backed PHP differential and value tracing extension</summary>
+  <description>
+    gameshark records PHP function-call counts, value traces, and invariant
+    hook activity for differential debugging of PHP applications.
+  </description>
+  <lead>
+    <name>php-gameshark maintainers</name>
+    <user>gameshark</user>
+    <email>noreply@example.invalid</email>
+    <active>yes</active>
+  </lead>
+  <date>2026-05-27</date>
+  <version>
+    <release>0.1.0</release>
+    <api>0.1.0</api>
+  </version>
+  <stability>
+    <release>devel</release>
+    <api>devel</api>
+  </stability>
+  <license>TBD</license>
+  <notes>Initial development package metadata for source builds.</notes>
+  <contents>
+    <dir name="/">
+      <file name="config.m4" role="src" />
+      <file name="Makefile.frag" role="src" />
+      <file name="gameshark.c" role="src" />
+      <file name="gameshark_core.h" role="src" />
+      <file name="php_gameshark.h" role="src" />
+      <file name="README.md" role="doc" />
+      <file name="SUPPORTED.md" role="doc" />
+      <dir name="rust">
+        <file name="Cargo.toml" role="src" />
+        <file name="Cargo.lock" role="src" />
+        <dir name="src">
+          <file name="lib.rs" role="src" />
+        </dir>
+      </dir>
+      <dir name="docs">
+        <file name="install.md" role="doc" />
+        <file name="release.md" role="doc" />
+      </dir>
+      <dir name="scripts">
+        <file name="build-unix.sh" role="script" />
+        <file name="smoke-load.sh" role="script" />
+        <file name="package-source.sh" role="script" />
+        <file name="package-binary-unix.sh" role="script" />
+      </dir>
+      <dir name="tests">
+        <file name="001-load.phpt" role="test" />
+        <file name="002-inactive-without-env.phpt" role="test" />
+        <file name="003-paired-compare.phpt" role="test" />
+        <file name="004-side-replacement.phpt" role="test" />
+        <file name="005-trace-values.phpt" role="test" />
+        <file name="006-trace-numeric.phpt" role="test" />
+        <file name="007-trace-combined-mode.phpt" role="test" />
+        <file name="008-trace-stack-args.phpt" role="test" />
+        <file name="009-json-report-untruncated.phpt" role="test" />
+        <file name="010-default-text-color.phpt" role="test" />
+        <file name="011-human-trace-format.phpt" role="test" />
+        <file name="012-trace-follow-transforms.phpt" role="test" />
+        <file name="013-invariants-basic.phpt" role="test" />
+        <file name="014-invariants-exceptions.phpt" role="test" />
+        <file name="015-invariants-invalid-config.phpt" role="test" />
+        <file name="016-invariants-builtins-basic.phpt" role="test" />
+        <file name="017-invariants-builtins-exceptions.phpt" role="test" />
+        <file name="018-invariants-wp-error-stdout.phpt" role="test" />
+        <file name="019-trace-allow-pattern.phpt" role="test" />
+      </dir>
+    </dir>
+  </contents>
+  <dependencies>
+    <required>
+      <php>
+        <min>8.0.0</min>
+      </php>
+      <pearinstaller>
+        <min>1.10.0</min>
+      </pearinstaller>
+    </required>
+  </dependencies>
+  <providesextension>gameshark</providesextension>
+  <extsrcrelease />
+</package>

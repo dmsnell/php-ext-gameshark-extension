@@ -10,7 +10,7 @@ GAMESHARK_SIDE=
 var_dump(gameshark_loaded());
 var_dump(gameshark_side());
 var_dump(gameshark_db_path());
-$compare = gameshark_compare();
+$compare = gameshark_compare("array");
 var_dump(isset($compare['error']));
 ?>
 --EXPECT--

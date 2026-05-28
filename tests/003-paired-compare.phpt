@@ -45,7 +45,7 @@ $cmd = sprintf(
     $php,
     escapeshellarg($ext),
     escapeshellarg(<<<'PHP'
-$compare = gameshark_compare();
+$compare = gameshark_compare("array");
 $left = array_column($compare['left_only'], 'display_name');
 $right = array_column($compare['right_only'], 'display_name');
 sort($left);
