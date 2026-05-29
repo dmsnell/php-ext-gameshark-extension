@@ -47,7 +47,7 @@ if test "$PHP_GAMESHARK" != "no"; then
       GAMESHARK_PLATFORM_LIBS="-ldl -lpthread -lm"
       ;;
     darwin*)
-      GAMESHARK_RUST_LINK_FLAGS="-Wl,-force_load,$GAMESHARK_RUST_LIB"
+      GAMESHARK_RUST_LINK_FLAGS="-Wl,-all_load $GAMESHARK_RUST_LIB -Wl,-noall_load"
       GAMESHARK_PLATFORM_LIBS="-lpthread -lm -framework Security -framework CoreFoundation -framework SystemConfiguration"
       ;;
     *)

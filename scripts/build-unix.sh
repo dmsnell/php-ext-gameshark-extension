@@ -96,12 +96,12 @@ done
 ./configure --with-php-config="$PHP_CONFIG" --enable-gameshark
 make -j"$JOBS"
 
-if [[ "${RUN_TESTS:-1}" != "0" ]]; then
-  make test TESTS="${TESTS:-tests/*.phpt}"
-fi
-
 if [[ "${RUN_SMOKE:-1}" != "0" ]]; then
   PHP_CONFIG="$PHP_CONFIG" EXTENSION="$(pwd)/modules/gameshark.so" scripts/smoke-load.sh
+fi
+
+if [[ "${RUN_TESTS:-1}" != "0" ]]; then
+  make test TESTS="${TESTS:-tests/*.phpt}"
 fi
 
 printf 'gameshark built successfully: %s\n' "$(pwd)/modules/gameshark.so"
