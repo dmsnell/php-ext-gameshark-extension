@@ -98,6 +98,22 @@ rm -f gameshark.la gameshark.lo modules/gameshark.so modules/gameshark.la .libs/
 ./configure --with-php-config="$PHP_CONFIG" --enable-gameshark
 make -j"$JOBS"
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  RUST_DYLIB="$(pwd)/rust/target/release/libgameshark_core.dylib"
+  if [[ ! -f "$RUST_DYLIB" ]]; then
+    echo "Rust dynamic library not found after build: $RUST_DYLIB" >&2
+    exit 1
+  fi
+  mkdir -p modules
+  cp "$RUST_DYLIB" modules/libgameshark_core.dylib
+  if command -v install_name_tool >/dev/null 2>&1; then
+    install_name_tool -id "@rpath/libgameshark_core.dylib" modules/libgameshark_core.dylib 2>/dev/null || true
+    for LOAD_NAME in "$RUST_DYLIB" ./rust/target/release/libgameshark_core.dylib rust/target/release/libgameshark_core.dylib libgameshark_core.dylib; do
+      install_name_tool -change "$LOAD_NAME" "@rpath/libgameshark_core.dylib" modules/gameshark.so 2>/dev/null || true
+    done
+  fi
+fi
+
 if [[ "${RUN_SMOKE:-1}" != "0" ]]; then
   PHP_CONFIG="$PHP_CONFIG" EXTENSION="$(pwd)/modules/gameshark.so" scripts/smoke-load.sh
 fi

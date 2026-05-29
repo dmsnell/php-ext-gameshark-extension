@@ -81,6 +81,15 @@ fi
 
 mkdir -p "$PACKAGE_ROOT" dist
 cp "$EXTENSION" "$PACKAGE_ROOT/gameshark.so"
+RUST_DYLIB=""
+if [[ "$OS_TAG" == "darwin" ]]; then
+  RUST_DYLIB="$(dirname "$EXTENSION")/libgameshark_core.dylib"
+  if [[ ! -f "$RUST_DYLIB" ]]; then
+    echo "macOS binary package requires $(dirname "$EXTENSION")/libgameshark_core.dylib" >&2
+    exit 1
+  fi
+  cp "$RUST_DYLIB" "$PACKAGE_ROOT/libgameshark_core.dylib"
+fi
 
 cat > "$PACKAGE_ROOT/manifest.json" <<JSON
 {
@@ -95,7 +104,8 @@ cat > "$PACKAGE_ROOT/manifest.json" <<JSON
   "arch": "$ARCH_TAG",
   "debug": "$DEBUG_TAG",
   "thread_safety": "$THREAD_TAG",
-  "binary": "gameshark.so"
+  "binary": "gameshark.so",
+  "runtime_libraries": $([[ "$OS_TAG" == "darwin" ]] && printf '["libgameshark_core.dylib"]' || printf '[]')
 }
 JSON
 
@@ -124,14 +134,17 @@ extension directory and add this to the target ini file:
 \`\`\`ini
 extension=gameshark.so
 \`\`\`
+
+macOS packages also include \`libgameshark_core.dylib\`. Keep it in the same
+directory as \`gameshark.so\`; the extension loads it via \`@loader_path\`.
 EOF
 
 (
   cd "$PACKAGE_ROOT"
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum gameshark.so manifest.json README-install.md > SHA256SUMS
+    sha256sum gameshark.so manifest.json README-install.md ${RUST_DYLIB:+libgameshark_core.dylib} > SHA256SUMS
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 gameshark.so manifest.json README-install.md > SHA256SUMS
+    shasum -a 256 gameshark.so manifest.json README-install.md ${RUST_DYLIB:+libgameshark_core.dylib} > SHA256SUMS
   fi
 )
 
