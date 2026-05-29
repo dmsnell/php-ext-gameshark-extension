@@ -64,6 +64,8 @@ Differential mode:
 GAMESHARK_DB=/tmp/run.sqlite GAMESHARK_SIDE=left php -d extension=gameshark.so script.php
 GAMESHARK_DB=/tmp/run.sqlite GAMESHARK_SIDE=right php -d extension=gameshark.so script.php
 GAMESHARK_DB=/tmp/run.sqlite php -d extension=gameshark.so -r 'echo gameshark_compare();'
+
+php -d extension=gameshark.so -d gameshark.db=/tmp/run.sqlite -d gameshark.side=left script.php
 ```
 
 Trace-value mode:
@@ -71,6 +73,9 @@ Trace-value mode:
 ```sh
 GAMESHARK_DB=/tmp/trace.sqlite GAMESHARK_TRACE_VALUE=needle php -d extension=gameshark.so script.php
 GAMESHARK_DB=/tmp/trace.sqlite php -d extension=gameshark.so -r 'echo gameshark_trace_report("json");'
+
+php -d extension=gameshark.so -d gameshark.db=/tmp/trace.sqlite -d gameshark.trace_value=needle script.php
+php -d extension=gameshark.so -d gameshark.db=/tmp/trace.sqlite -r 'echo gameshark_trace_report("json");'
 ```
 
 Unused runtime coverage mode:

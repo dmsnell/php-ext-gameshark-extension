@@ -253,6 +253,10 @@ static const zend_function_entry gameshark_functions[] = {
 };
 
 PHP_INI_BEGIN()
+	PHP_INI_ENTRY("gameshark.db", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
+	PHP_INI_ENTRY("gameshark.side", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
+	PHP_INI_ENTRY("gameshark.trace_value", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
+	PHP_INI_ENTRY("gameshark.trace_follow_transforms", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
 	PHP_INI_ENTRY("gameshark.trace_allow_pattern", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
 	PHP_INI_ENTRY("gameshark.invariants", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
 	PHP_INI_ENTRY("gameshark.invariants_file", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
@@ -593,6 +597,20 @@ static bool gameshark_config_has_value(const char *value)
 		value++;
 	}
 	return false;
+}
+
+static const char *gameshark_configured_db_path(void)
+{
+	if (gameshark_config_has_value(gameshark_request_db_path)) {
+		return gameshark_request_db_path;
+	}
+
+	const char *db_path_ini = zend_ini_string_literal("gameshark.db");
+	if (gameshark_config_has_value(db_path_ini)) {
+		return db_path_ini;
+	}
+
+	return getenv("GAMESHARK_DB");
 }
 
 static bool gameshark_is_absolute_path(const char *path)
@@ -3218,10 +3236,14 @@ PHP_RINIT_FUNCTION(gameshark)
 	ZEND_TSRMLS_CACHE_UPDATE();
 #endif
 
-	const char *db_path = getenv("GAMESHARK_DB");
-	const char *side = getenv("GAMESHARK_SIDE");
-	const char *trace_value = getenv("GAMESHARK_TRACE_VALUE");
-	const char *follow_transforms = getenv("GAMESHARK_TRACE_FOLLOW_TRANSFORMS");
+	const char *db_path_ini = zend_ini_string_literal("gameshark.db");
+	const char *db_path_env = getenv("GAMESHARK_DB");
+	const char *side_ini = zend_ini_string_literal("gameshark.side");
+	const char *side_env = getenv("GAMESHARK_SIDE");
+	const char *trace_value_ini = zend_ini_string_literal("gameshark.trace_value");
+	const char *trace_value_env = getenv("GAMESHARK_TRACE_VALUE");
+	const char *follow_transforms_ini = zend_ini_string_literal("gameshark.trace_follow_transforms");
+	const char *follow_transforms_env = getenv("GAMESHARK_TRACE_FOLLOW_TRANSFORMS");
 	const char *trace_allow_pattern_ini = zend_ini_string_literal("gameshark.trace_allow_pattern");
 	const char *trace_allow_pattern_env = getenv("GAMESHARK_TRACE_ALLOW_PATTERN");
 	const char *invariants_ini = zend_ini_string_literal("gameshark.invariants");
@@ -3234,8 +3256,14 @@ PHP_RINIT_FUNCTION(gameshark)
 	const char *unused_capture_query_ini = zend_ini_string_literal("gameshark.unused_capture_query");
 	const char *unused_env = getenv("GAMESHARK_UNUSED");
 	const char *unused_capture_query_env = getenv("GAMESHARK_UNUSED_CAPTURE_QUERY");
+	const char *db_path = gameshark_config_has_value(db_path_ini) ? db_path_ini : db_path_env;
+	const char *side = gameshark_config_has_value(side_ini) ? side_ini : side_env;
+	const char *trace_value = gameshark_config_has_value(trace_value_ini) ? trace_value_ini : trace_value_env;
 	bool valid_side = side != NULL && (strcmp(side, "left") == 0 || strcmp(side, "right") == 0);
 	bool wants_trace = trace_value != NULL && trace_value[0] != '\0';
+	bool trace_follow_transforms = gameshark_config_has_value(follow_transforms_ini)
+		? gameshark_config_truthy(follow_transforms_ini)
+		: gameshark_config_truthy(follow_transforms_env);
 	const char *trace_allow_pattern = gameshark_config_has_value(trace_allow_pattern_ini)
 		? trace_allow_pattern_ini
 		: trace_allow_pattern_env;
@@ -3282,7 +3310,7 @@ PHP_RINIT_FUNCTION(gameshark)
 	if (wants_trace && !gameshark_configure_trace_value(trace_value)) {
 		return SUCCESS;
 	}
-	gameshark_trace_follow_transforms = wants_trace && follow_transforms != NULL && follow_transforms[0] != '\0' && strcmp(follow_transforms, "0") != 0;
+	gameshark_trace_follow_transforms = wants_trace && trace_follow_transforms;
 
 	const char *script_filename = SG(request_info).path_translated;
 	if (script_filename == NULL) {
@@ -3417,10 +3445,11 @@ PHP_FUNCTION(gameshark_db_path)
 {
 	ZEND_PARSE_PARAMETERS_NONE();
 
-	if (gameshark_request_db_path == NULL) {
+	const char *db_path = gameshark_configured_db_path();
+	if (!gameshark_config_has_value(db_path)) {
 		RETURN_NULL();
 	}
-	RETURN_STRING(gameshark_request_db_path);
+	RETURN_STRING(db_path);
 }
 
 PHP_FUNCTION(gameshark_invariants_status)
@@ -3580,10 +3609,7 @@ PHP_FUNCTION(gameshark_compare)
 		RETURN_THROWS();
 	}
 
-	const char *db_path = gameshark_request_db_path;
-	if (db_path == NULL || db_path[0] == '\0') {
-		db_path = getenv("GAMESHARK_DB");
-	}
+	const char *db_path = gameshark_configured_db_path();
 
 	if (report_format == GAMESHARK_REPORT_TEXT) {
 		gameshark_return_text_report(INTERNAL_FUNCTION_PARAM_PASSTHRU, gameshark_core_compare_text(db_path, gameshark_report_color_enabled() ? 1 : 0));
@@ -3613,10 +3639,7 @@ PHP_FUNCTION(gameshark_trace_report)
 		RETURN_THROWS();
 	}
 
-	const char *db_path = gameshark_request_db_path;
-	if (db_path == NULL || db_path[0] == '\0') {
-		db_path = getenv("GAMESHARK_DB");
-	}
+	const char *db_path = gameshark_configured_db_path();
 
 	if (report_format == GAMESHARK_REPORT_TEXT) {
 		gameshark_return_text_report(INTERNAL_FUNCTION_PARAM_PASSTHRU, gameshark_core_trace_report_text(db_path, gameshark_report_color_enabled() ? 1 : 0));
@@ -3649,10 +3672,7 @@ PHP_FUNCTION(gameshark_unused_report)
 		RETURN_THROWS();
 	}
 
-	const char *db_path = gameshark_request_db_path;
-	if (db_path == NULL || db_path[0] == '\0') {
-		db_path = getenv("GAMESHARK_DB");
-	}
+	const char *db_path = gameshark_configured_db_path();
 
 	int64_t selected_run_id = run_id_is_null ? -1 : (int64_t)run_id;
 	if (report_format == GAMESHARK_REPORT_TEXT) {
