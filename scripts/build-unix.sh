@@ -92,6 +92,8 @@ for PHPIZE_ARTIFACT in build run-tests.php; do
   fi
 done
 
+rm -f gameshark.la gameshark.lo modules/gameshark.so modules/gameshark.la .libs/gameshark.so .libs/gameshark.la
+
 "$PHPIZE"
 ./configure --with-php-config="$PHP_CONFIG" --enable-gameshark
 make -j"$JOBS"

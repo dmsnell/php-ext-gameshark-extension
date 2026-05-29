@@ -23,6 +23,18 @@ if [[ -z "$PHP_BIN" || ! -x "$PHP_BIN" ]]; then
   exit 1
 fi
 
+if [[ "$(uname -s)" == "Darwin" ]] && command -v nm >/dev/null 2>&1; then
+  UNRESOLVED_RUST_SYMBOLS="$(
+    nm -u "$EXTENSION" 2>/dev/null |
+      awk '/ U _?(_R|_ZN|rust_|serde|rusqlite|regex|aho_corasick|hashbrown|sqlite3_)/ { print }'
+  )"
+  if [[ -n "$UNRESOLVED_RUST_SYMBOLS" ]]; then
+    echo "extension has unresolved Rust dependency symbols; rebuild from clean ignored artifacts" >&2
+    echo "$UNRESOLVED_RUST_SYMBOLS" >&2
+    exit 1
+  fi
+fi
+
 "$PHP_BIN" -n -d "extension=$EXTENSION" --ri gameshark >/dev/null
 "$PHP_BIN" -n -d "extension=$EXTENSION" -r 'if (!extension_loaded("gameshark") || !gameshark_loaded()) { exit(1); }'
 
