@@ -1,6 +1,10 @@
+#[cfg(feature = "backend-mysql")]
+use mysql::prelude::*;
+#[cfg(feature = "backend-redis")]
+use redis::Commands;
 use regex::Regex;
 use rusqlite::{params, Connection, Transaction};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
@@ -8,7 +12,7 @@ use std::fmt::Write as _;
 use std::os::raw::{c_char, c_int};
 use std::slice;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[repr(C)]
 pub struct GamesharkCoreStr {
@@ -71,7 +75,65 @@ pub struct GamesharkCoreUnusedAccess {
     end_line: u32,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[repr(C)]
+pub struct GamesharkCoreStorageConfig {
+    storage_ini: *const c_char,
+    storage_env: *const c_char,
+    dsn_ini: *const c_char,
+    dsn_env: *const c_char,
+    legacy_db_ini: *const c_char,
+    legacy_db_env: *const c_char,
+    capture_ini: *const c_char,
+    capture_env: *const c_char,
+    mysql_host_ini: *const c_char,
+    mysql_host_env: *const c_char,
+    mysql_port_ini: *const c_char,
+    mysql_port_env: *const c_char,
+    mysql_database_ini: *const c_char,
+    mysql_database_env: *const c_char,
+    mysql_username_ini: *const c_char,
+    mysql_username_env: *const c_char,
+    mysql_password_ini: *const c_char,
+    mysql_password_env: *const c_char,
+    mysql_password_file_ini: *const c_char,
+    mysql_password_file_env: *const c_char,
+    mysql_socket_ini: *const c_char,
+    mysql_socket_env: *const c_char,
+    mysql_ssl_mode_ini: *const c_char,
+    mysql_ssl_mode_env: *const c_char,
+    mysql_schema_mode_ini: *const c_char,
+    mysql_schema_mode_env: *const c_char,
+    mysql_connect_timeout_ms_ini: *const c_char,
+    mysql_connect_timeout_ms_env: *const c_char,
+    mysql_operation_timeout_ms_ini: *const c_char,
+    mysql_operation_timeout_ms_env: *const c_char,
+    mysql_report_timeout_ms_ini: *const c_char,
+    mysql_report_timeout_ms_env: *const c_char,
+    redis_host_ini: *const c_char,
+    redis_host_env: *const c_char,
+    redis_port_ini: *const c_char,
+    redis_port_env: *const c_char,
+    redis_database_ini: *const c_char,
+    redis_database_env: *const c_char,
+    redis_username_ini: *const c_char,
+    redis_username_env: *const c_char,
+    redis_password_ini: *const c_char,
+    redis_password_env: *const c_char,
+    redis_password_file_ini: *const c_char,
+    redis_password_file_env: *const c_char,
+    redis_key_prefix_ini: *const c_char,
+    redis_key_prefix_env: *const c_char,
+    redis_ttl_ini: *const c_char,
+    redis_ttl_env: *const c_char,
+    redis_connect_timeout_ms_ini: *const c_char,
+    redis_connect_timeout_ms_env: *const c_char,
+    redis_operation_timeout_ms_ini: *const c_char,
+    redis_operation_timeout_ms_env: *const c_char,
+    redis_report_timeout_ms_ini: *const c_char,
+    redis_report_timeout_ms_env: *const c_char,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 struct FunctionKey {
     kind: FunctionKind,
     scope_name: Option<String>,
@@ -81,7 +143,7 @@ struct FunctionKey {
     end_line: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum FunctionKind {
     Function,
@@ -113,7 +175,7 @@ impl FunctionKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum UnusedSymbolKind {
     Function,
@@ -148,7 +210,7 @@ impl UnusedSymbolKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum UnusedAccessKind {
     FunctionCall,
@@ -211,13 +273,14 @@ impl UnusedAccessKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 struct UnusedSymbolKey {
     kind: UnusedSymbolKind,
     scope_name: Option<String>,
     name: String,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 struct UnusedDeclaration {
     key: UnusedSymbolKey,
     display_name: String,
@@ -229,6 +292,7 @@ struct UnusedDeclaration {
     flags: u32,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 struct UnusedAccess {
     key: UnusedSymbolKey,
     access_kind: UnusedAccessKind,
@@ -241,22 +305,134 @@ struct UnusedAccess {
     count: u64,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
 struct UnusedIncludedFile {
     file: String,
     include_count: u64,
 }
 
+#[derive(Clone, Debug)]
+enum StorageTarget {
+    Sqlite {
+        path: String,
+    },
+    Mysql {
+        dsn: String,
+        display: String,
+        host: Option<String>,
+        port: Option<u16>,
+        database: Option<String>,
+        socket: Option<String>,
+        schema_mode: SchemaMode,
+        connect_timeout_ms: u64,
+        operation_timeout_ms: u64,
+        report_timeout_ms: u64,
+    },
+    Redis {
+        dsn: String,
+        display: String,
+        host: Option<String>,
+        port: Option<u16>,
+        database: Option<i64>,
+        key_prefix: String,
+        ttl: u64,
+        connect_timeout_ms: u64,
+        operation_timeout_ms: u64,
+        report_timeout_ms: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SchemaMode {
+    Auto,
+    Validate,
+}
+
+impl SchemaMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Validate => "validate",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StorageError {
+    code: String,
+    backend: Option<String>,
+    message: String,
+    hint: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedStorageConfig {
+    target: Option<StorageTarget>,
+    capture: String,
+    sources: StorageSources,
+    ignored_legacy_sqlite_path: Option<String>,
+    error: Option<StorageError>,
+}
+
+#[derive(Clone, Debug)]
+struct StorageSources {
+    storage: String,
+    dsn: String,
+    legacy_db: String,
+    capture: String,
+    credentials: String,
+    schema_mode: String,
+    timeouts: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct DiffPayload {
+    run_id: i64,
+    capture: String,
+    side: String,
+    started_at: i64,
+    finished_at: i64,
+    php_version: String,
+    sapi: String,
+    pid: u32,
+    script_filename: Option<String>,
+    functions: Vec<StoredFunctionCount>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct StoredFunctionCount {
+    function: FunctionKey,
+    call_count: u64,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct UnusedSnapshot {
+    run: UnusedRunReport,
+    declarations: Vec<UnusedDeclaration>,
+    accesses: Vec<UnusedAccess>,
+    included_files: Vec<UnusedIncludedFile>,
+}
+
 struct State {
-    db_path: String,
+    storage: StorageTarget,
+    capture: String,
     side: Option<String>,
     started_at: i64,
     started_monotonic: Instant,
     last_elapsed_ns: u64,
     trace_run_id: Option<i64>,
+    trace_value: Option<String>,
+    trace_value_kind: Option<String>,
     php_version: String,
     sapi_name: String,
     pid: u32,
     script_filename: Option<String>,
+    request_path: Option<String>,
+    request_uri_full: Option<String>,
+    query_string: Option<String>,
+    new_opcode_handler_active: bool,
+    constant_opcode_handler_active: bool,
+    class_constant_opcode_handler_active: bool,
     trace_filter: TraceFilter,
     counters: HashMap<FunctionKey, u64>,
     trace_events: Vec<TraceEvent>,
@@ -346,20 +522,20 @@ struct CompareRow {
     delta: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct TraceReport {
     summary: TraceSummary,
     runs: Vec<TraceRunReport>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct TraceSummary {
     run_count: usize,
     event_count: usize,
     transformed_value_count: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct TraceRunReport {
     run_id: i64,
     started_at: i64,
@@ -378,7 +554,7 @@ struct TraceRunReport {
     events: Vec<TraceEventReport>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct TraceFilterReport {
     mode: String,
     allow_pattern: Option<String>,
@@ -393,7 +569,7 @@ struct TraceFilterReport {
     transform_frames_started: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct TransformedValueReport {
     value_id: u32,
     parent_value_id: u32,
@@ -409,7 +585,7 @@ struct TransformedValueReport {
     preview: String,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct TraceEventReport {
     event_index: u64,
     elapsed_ns: u64,
@@ -431,7 +607,7 @@ struct TraceEventReport {
     stack_frames: serde_json::Value,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct UnusedReport {
     summary: UnusedSummary,
     run: Option<UnusedRunReport>,
@@ -446,7 +622,7 @@ struct UnusedReport {
     included_files_without_declarations: Vec<UnusedIncludedFileReport>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct UnusedSummary {
     run_count: usize,
     run_id: Option<i64>,
@@ -464,7 +640,7 @@ struct UnusedSummary {
     included_file_without_declaration_count: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct UnusedRunReport {
     run_id: i64,
     started_at: i64,
@@ -483,7 +659,7 @@ struct UnusedRunReport {
     caveats: Vec<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct UnusedReportRow {
     kind: String,
     display_name: String,
@@ -501,7 +677,7 @@ struct UnusedReportRow {
     file_had_any_access: Option<bool>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct UnusedIncludedFileReport {
     file: String,
     include_count: u64,
@@ -515,10 +691,12 @@ struct UnusedIncludedFileReport {
 }
 
 static STATE: LazyLock<Mutex<Option<State>>> = LazyLock::new(|| Mutex::new(None));
+static LAST_STORAGE_ERROR: LazyLock<Mutex<Option<StorageError>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 #[no_mangle]
 pub extern "C" fn gameshark_core_request_start(
-    db_path: *const c_char,
+    storage_config: *const GamesharkCoreStorageConfig,
     side: *const c_char,
     trace_value: *const c_char,
     trace_allow_pattern: *const c_char,
@@ -534,13 +712,15 @@ pub extern "C" fn gameshark_core_request_start(
     constant_opcode_handler_active: c_int,
     class_constant_opcode_handler_active: c_int,
 ) -> c_int {
-    let Some(db_path) = c_string(db_path) else {
-        return 0;
-    };
-
     let side = c_string(side).filter(|value| !value.is_empty());
     if let Some(side) = side.as_deref() {
         if side != "left" && side != "right" {
+            set_last_storage_error(Some(StorageError {
+                code: "config_invalid_side".to_string(),
+                backend: None,
+                message: format!("invalid differential side {side:?}; expected left or right"),
+                hint: Some("Set gameshark.side or GAMESHARK_SIDE to left or right.".to_string()),
+            }));
             return 0;
         }
     }
@@ -548,8 +728,24 @@ pub extern "C" fn gameshark_core_request_start(
     let trace_value = c_string(trace_value).filter(|value| !value.is_empty());
     let unused_enabled = unused_enabled != 0;
     if side.is_none() && trace_value.is_none() && !unused_enabled {
+        set_last_storage_error(None);
         return 0;
     }
+
+    let parsed = parse_storage_config(storage_config);
+    if let Some(error) = parsed.error.clone() {
+        set_last_storage_error(Some(error));
+        return 0;
+    }
+    let Some(storage) = parsed.target.clone() else {
+        set_last_storage_error(None);
+        return 0;
+    };
+    if let Err(error) = validate_storage_for_start(&storage) {
+        set_last_storage_error(Some(error));
+        return 0;
+    }
+    set_last_storage_error(None);
 
     let php_version = c_string(php_version).unwrap_or_default();
     let sapi_name = c_string(sapi_name).unwrap_or_default();
@@ -562,36 +758,53 @@ pub extern "C" fn gameshark_core_request_start(
     let trace_value_kind = trace_value.as_deref().map(trace_value_kind);
     let trace_filter = build_trace_filter(c_string(trace_allow_pattern).as_deref());
 
-    if let Some(side) = side.as_deref() {
-        if initialize_side(
-            &db_path,
-            side,
-            started_at,
-            &php_version,
-            &sapi_name,
-            pid,
-            script_filename.as_deref(),
-        )
-        .is_err()
-        {
-            return 0;
+    if let StorageTarget::Sqlite { path } = &storage {
+        if let Some(side) = side.as_deref() {
+            if let Err(message) = initialize_side(
+                path,
+                side,
+                started_at,
+                &php_version,
+                &sapi_name,
+                pid,
+                script_filename.as_deref(),
+            ) {
+                set_last_storage_error(Some(StorageError {
+                    code: "storage_start_failed".to_string(),
+                    backend: Some("sqlite".to_string()),
+                    message,
+                    hint: Some("Check that the SQLite path is writable.".to_string()),
+                }));
+                return 0;
+            }
         }
     }
 
     let trace_run_id = if let Some(trace_value) = trace_value.as_deref() {
-        match initialize_trace_run(
-            &db_path,
-            started_at_ns,
-            trace_value,
-            trace_value_kind.as_deref().unwrap_or("string"),
-            &trace_filter,
-            &php_version,
-            &sapi_name,
-            pid,
-            script_filename.as_deref(),
-        ) {
-            Ok(run_id) => Some(run_id),
-            Err(_) => return 0,
+        match &storage {
+            StorageTarget::Sqlite { path } => match initialize_trace_run(
+                path,
+                started_at_ns,
+                trace_value,
+                trace_value_kind.as_deref().unwrap_or("string"),
+                &trace_filter,
+                &php_version,
+                &sapi_name,
+                pid,
+                script_filename.as_deref(),
+            ) {
+                Ok(run_id) => Some(run_id),
+                Err(message) => {
+                    set_last_storage_error(Some(StorageError {
+                        code: "storage_start_failed".to_string(),
+                        backend: Some("sqlite".to_string()),
+                        message,
+                        hint: Some("Check that the SQLite path is writable.".to_string()),
+                    }));
+                    return 0;
+                }
+            },
+            _ => Some(started_at_ns),
         }
     } else {
         None
@@ -617,22 +830,33 @@ pub extern "C" fn gameshark_core_request_start(
                     .to_string(),
             );
         }
-        match initialize_unused_run(
-            &db_path,
-            started_at_ns,
-            &php_version,
-            &sapi_name,
-            pid,
-            script_filename.as_deref(),
-            request_path.as_deref(),
-            request_uri_full.as_deref(),
-            query_string.as_deref(),
-            new_opcode_handler_active != 0,
-            constant_opcode_handler_active != 0,
-            class_constant_opcode_handler_active != 0,
-        ) {
-            Ok(run_id) => Some(run_id),
-            Err(_) => return 0,
+        match &storage {
+            StorageTarget::Sqlite { path } => match initialize_unused_run(
+                path,
+                started_at_ns,
+                &php_version,
+                &sapi_name,
+                pid,
+                script_filename.as_deref(),
+                request_path.as_deref(),
+                request_uri_full.as_deref(),
+                query_string.as_deref(),
+                new_opcode_handler_active != 0,
+                constant_opcode_handler_active != 0,
+                class_constant_opcode_handler_active != 0,
+            ) {
+                Ok(run_id) => Some(run_id),
+                Err(message) => {
+                    set_last_storage_error(Some(StorageError {
+                        code: "storage_start_failed".to_string(),
+                        backend: Some("sqlite".to_string()),
+                        message,
+                        hint: Some("Check that the SQLite path is writable.".to_string()),
+                    }));
+                    return 0;
+                }
+            },
+            _ => Some(started_at_ns.saturating_add(1)),
         }
     } else {
         None
@@ -640,16 +864,25 @@ pub extern "C" fn gameshark_core_request_start(
 
     let mut state = STATE.lock().expect("gameshark state lock poisoned");
     *state = Some(State {
-        db_path,
+        storage,
+        capture: parsed.capture,
         side,
         started_at,
         started_monotonic: Instant::now(),
         last_elapsed_ns: 0,
         trace_run_id,
+        trace_value,
+        trace_value_kind,
         php_version,
         sapi_name,
         pid,
         script_filename,
+        request_path,
+        request_uri_full,
+        query_string,
+        new_opcode_handler_active: new_opcode_handler_active != 0,
+        constant_opcode_handler_active: constant_opcode_handler_active != 0,
+        class_constant_opcode_handler_active: class_constant_opcode_handler_active != 0,
         trace_filter,
         counters: HashMap::new(),
         trace_events: Vec::new(),
@@ -995,8 +1228,10 @@ pub extern "C" fn gameshark_core_request_finish() {
 }
 
 #[no_mangle]
-pub extern "C" fn gameshark_core_compare_json(db_path: *const c_char) -> *mut c_char {
-    report_json(db_path, compare_json, || {
+pub extern "C" fn gameshark_core_compare_json(
+    storage_config: *const GamesharkCoreStorageConfig,
+) -> *mut c_char {
+    storage_report_json(storage_config, compare_json_for_storage, || {
         serde_json::json!({
             "summary": {
                 "left_total_calls": 0,
@@ -1014,16 +1249,21 @@ pub extern "C" fn gameshark_core_compare_json(db_path: *const c_char) -> *mut c_
 }
 
 #[no_mangle]
-pub extern "C" fn gameshark_core_compare_text(db_path: *const c_char, color: c_int) -> *mut c_char {
-    report_text(db_path, |db_path| {
-        let report = compare_report(db_path)?;
+pub extern "C" fn gameshark_core_compare_text(
+    storage_config: *const GamesharkCoreStorageConfig,
+    color: c_int,
+) -> *mut c_char {
+    storage_report_text(storage_config, |target, capture| {
+        let report = compare_report_for_storage(target, capture)?;
         Ok(render_compare_text(&report, color != 0))
     })
 }
 
 #[no_mangle]
-pub extern "C" fn gameshark_core_trace_report_json(db_path: *const c_char) -> *mut c_char {
-    report_json(db_path, trace_report_json, || {
+pub extern "C" fn gameshark_core_trace_report_json(
+    storage_config: *const GamesharkCoreStorageConfig,
+) -> *mut c_char {
+    storage_report_json(storage_config, trace_report_json_for_storage, || {
         serde_json::json!({
             "summary": {
                 "run_count": 0,
@@ -1037,64 +1277,81 @@ pub extern "C" fn gameshark_core_trace_report_json(db_path: *const c_char) -> *m
 
 #[no_mangle]
 pub extern "C" fn gameshark_core_trace_report_text(
-    db_path: *const c_char,
+    storage_config: *const GamesharkCoreStorageConfig,
     color: c_int,
 ) -> *mut c_char {
-    report_text(db_path, |db_path| {
-        let report = trace_report(db_path)?;
+    storage_report_text(storage_config, |target, capture| {
+        let report = trace_report_for_storage(target, capture)?;
         Ok(render_trace_text(&report, color != 0))
     })
 }
 
 #[no_mangle]
 pub extern "C" fn gameshark_core_unused_report_json(
-    db_path: *const c_char,
+    storage_config: *const GamesharkCoreStorageConfig,
     run_id: i64,
 ) -> *mut c_char {
-    report_json(
-        db_path,
-        |db_path| unused_report_json(db_path, run_id),
-        || {
-            serde_json::json!({
-                "summary": {
-                    "run_count": 0,
-                    "run_id": null,
-                    "declaration_count": 0,
-                    "access_count": 0,
-                    "uncalled_function_count": 0,
-                    "uncalled_concrete_method_count": 0,
-                    "class_without_new_count": 0,
-                    "global_constant_without_value_access_count": 0,
-                    "class_constant_without_value_access_count": 0,
-                    "global_constant_without_read_count": 0,
-                    "class_constant_without_read_count": 0,
-                    "included_file_count": 0,
-                    "included_file_with_no_accessed_declaration_count": 0,
-                    "included_file_without_declaration_count": 0
-                },
-                "run": null,
-                "uncalled_functions": [],
-                "uncalled_concrete_methods": [],
-                "classes_with_no_new_opcode_observed": [],
-                "global_constants_without_value_access_observed": [],
-                "class_constants_without_value_access_observed": [],
-                "global_constants_without_read_observed": [],
-                "class_constants_without_read_observed": [],
-                "included_files_with_no_accessed_declarations": [],
-                "included_files_without_declarations": []
-            })
-        },
+    storage_report_json(
+        storage_config,
+        |target, capture| unused_report_json_for_storage(target, capture, run_id),
+        empty_unused_report_json,
     )
 }
 
 #[no_mangle]
 pub extern "C" fn gameshark_core_unused_report_text(
-    db_path: *const c_char,
+    storage_config: *const GamesharkCoreStorageConfig,
     color: c_int,
     run_id: i64,
 ) -> *mut c_char {
-    report_text(db_path, |db_path| {
-        let report = unused_report(db_path, run_id)?;
+    storage_report_text(storage_config, |target, capture| {
+        let report = unused_report_for_storage(target, capture, run_id)?;
+        Ok(render_unused_text(&report, color != 0))
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn gameshark_core_unused_aggregate_report_json(
+    storage_config: *const GamesharkCoreStorageConfig,
+    capture: *const c_char,
+    since_run_id: i64,
+    until_run_id: i64,
+) -> *mut c_char {
+    storage_report_json(
+        storage_config,
+        |target, parsed_capture| {
+            let capture = c_string(capture)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| parsed_capture.to_string());
+            let report =
+                unused_aggregate_report_for_storage(target, &capture, since_run_id, until_run_id)?;
+            serde_json::to_string(&report).map_err(|error| {
+                storage_error(
+                    target.backend_name(),
+                    "report_encode_failed",
+                    error.to_string(),
+                    None,
+                )
+            })
+        },
+        empty_unused_report_json,
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn gameshark_core_unused_aggregate_report_text(
+    storage_config: *const GamesharkCoreStorageConfig,
+    color: c_int,
+    capture: *const c_char,
+    since_run_id: i64,
+    until_run_id: i64,
+) -> *mut c_char {
+    storage_report_text(storage_config, |target, parsed_capture| {
+        let capture = c_string(capture)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| parsed_capture.to_string());
+        let report =
+            unused_aggregate_report_for_storage(target, &capture, since_run_id, until_run_id)?;
         Ok(render_unused_text(&report, color != 0))
     })
 }
@@ -1106,45 +1363,137 @@ pub unsafe extern "C" fn gameshark_core_string_free(ptr: *mut c_char) {
     }
 }
 
-fn report_json<F, E>(db_path: *const c_char, build: F, empty: E) -> *mut c_char
+fn storage_report_json<F, E>(
+    storage_config: *const GamesharkCoreStorageConfig,
+    build: F,
+    empty: E,
+) -> *mut c_char
 where
-    F: FnOnce(&str) -> Result<String, String>,
+    F: FnOnce(&StorageTarget, &str) -> Result<String, StorageError>,
     E: FnOnce() -> serde_json::Value,
 {
-    let result = c_string(db_path)
-        .ok_or_else(|| "GAMESHARK_DB is not set".to_string())
-        .and_then(|db_path| build(&db_path));
+    let result = storage_target_for_report(storage_config)
+        .and_then(|(target, capture)| build(&target, &capture));
     let json = match result {
         Ok(json) => json,
         Err(error) => {
             let mut value = empty();
             if let serde_json::Value::Object(ref mut object) = value {
-                object.insert("error".to_string(), serde_json::Value::String(error));
+                object.insert(
+                    "error".to_string(),
+                    serde_json::Value::String(error.message.clone()),
+                );
+                object.insert(
+                    "error_code".to_string(),
+                    serde_json::Value::String(error.code.clone()),
+                );
+                object.insert(
+                    "error_backend".to_string(),
+                    error
+                        .backend
+                        .as_ref()
+                        .map(|value| serde_json::Value::String(value.clone()))
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                object.insert(
+                    "error_hint".to_string(),
+                    error
+                        .hint
+                        .as_ref()
+                        .map(|value| serde_json::Value::String(value.clone()))
+                        .unwrap_or(serde_json::Value::Null),
+                );
             }
             value.to_string()
         }
     };
 
-    CString::new(json)
-        .unwrap_or_else(|_| CString::new("{\"error\":\"invalid json\"}").unwrap())
-        .into_raw()
+    c_string_from_string(json)
 }
 
-fn report_text<F>(db_path: *const c_char, build: F) -> *mut c_char
+fn storage_report_text<F>(
+    storage_config: *const GamesharkCoreStorageConfig,
+    build: F,
+) -> *mut c_char
 where
-    F: FnOnce(&str) -> Result<String, String>,
+    F: FnOnce(&StorageTarget, &str) -> Result<String, StorageError>,
 {
-    let text = c_string(db_path)
-        .ok_or_else(|| "GAMESHARK_DB is not set".to_string())
-        .and_then(|db_path| build(&db_path))
-        .unwrap_or_else(|error| format!("Gameshark report error: {error}\n"));
+    let text = storage_target_for_report(storage_config)
+        .and_then(|(target, capture)| build(&target, &capture))
+        .unwrap_or_else(render_storage_error_text);
 
-    CString::new(text)
-        .unwrap_or_else(|error| {
-            let text = error.into_vec();
-            CString::new(String::from_utf8_lossy(&text).replace('\0', "\\0")).unwrap()
-        })
-        .into_raw()
+    c_string_from_string(text)
+}
+
+fn empty_unused_report_json() -> serde_json::Value {
+    serde_json::json!({
+        "summary": {
+            "run_count": 0,
+            "run_id": null,
+            "declaration_count": 0,
+            "access_count": 0,
+            "uncalled_function_count": 0,
+            "uncalled_concrete_method_count": 0,
+            "class_without_new_count": 0,
+            "global_constant_without_value_access_count": 0,
+            "class_constant_without_value_access_count": 0,
+            "global_constant_without_read_count": 0,
+            "class_constant_without_read_count": 0,
+            "included_file_count": 0,
+            "included_file_with_no_accessed_declaration_count": 0,
+            "included_file_without_declaration_count": 0
+        },
+        "run": null,
+        "uncalled_functions": [],
+        "uncalled_concrete_methods": [],
+        "classes_with_no_new_opcode_observed": [],
+        "global_constants_without_value_access_observed": [],
+        "class_constants_without_value_access_observed": [],
+        "global_constants_without_read_observed": [],
+        "class_constants_without_read_observed": [],
+        "included_files_with_no_accessed_declarations": [],
+        "included_files_without_declarations": []
+    })
+}
+
+fn storage_target_for_report(
+    storage_config: *const GamesharkCoreStorageConfig,
+) -> Result<(StorageTarget, String), StorageError> {
+    let parsed = parse_storage_config(storage_config);
+    if let Some(error) = parsed.error {
+        return Err(error);
+    }
+    let Some(target) = parsed.target else {
+        return Err(StorageError {
+            code: "config_missing_storage".to_string(),
+            backend: None,
+            message: "Gameshark storage is not configured".to_string(),
+            hint: Some(
+                "Set gameshark.db/GAMESHARK_DB or gameshark.storage plus connection settings."
+                    .to_string(),
+            ),
+        });
+    };
+    Ok((target, parsed.capture))
+}
+
+fn render_storage_error_text(error: StorageError) -> String {
+    format!(
+        "Gameshark report error\ncode: {}\nbackend: {}\nmessage: {}\nhint: {}\n",
+        error.code,
+        error.backend.as_deref().unwrap_or("none"),
+        error.message,
+        error.hint.as_deref().unwrap_or("")
+    )
+}
+
+fn storage_error(backend: &str, code: &str, message: String, hint: Option<&str>) -> StorageError {
+    StorageError {
+        code: code.to_string(),
+        backend: Some(backend.to_string()),
+        message,
+        hint: hint.map(str::to_string),
+    }
 }
 
 fn c_string(ptr: *const c_char) -> Option<String> {
@@ -1153,6 +1502,1148 @@ fn c_string(ptr: *const c_char) -> Option<String> {
     }
     let string = unsafe { CStr::from_ptr(ptr) };
     Some(string.to_string_lossy().into_owned())
+}
+
+fn set_last_storage_error(error: Option<StorageError>) {
+    let mut guard = LAST_STORAGE_ERROR
+        .lock()
+        .expect("gameshark storage error lock poisoned");
+    *guard = error;
+}
+
+#[no_mangle]
+pub extern "C" fn gameshark_core_last_error_json() -> *mut c_char {
+    let error = LAST_STORAGE_ERROR
+        .lock()
+        .expect("gameshark storage error lock poisoned")
+        .clone();
+    let json = match error {
+        Some(error) => serde_json::to_string(&error).unwrap_or_else(|_| "{}".to_string()),
+        None => "null".to_string(),
+    };
+    c_string_from_string(json)
+}
+
+#[no_mangle]
+pub extern "C" fn gameshark_core_storage_status_json(
+    storage_config: *const GamesharkCoreStorageConfig,
+) -> *mut c_char {
+    let parsed = parse_storage_config(storage_config);
+    let target = parsed.target.as_ref();
+    let backend = target.map(StorageTarget::backend_name);
+    let schema_mode = target.and_then(StorageTarget::schema_mode_name);
+    let schema_status = if parsed.error.is_some() {
+        "invalid"
+    } else if target.is_some() {
+        "not_checked"
+    } else {
+        "unknown"
+    };
+    let value = serde_json::json!({
+        "configured": target.is_some() || parsed.error.is_some(),
+        "active": STATE.lock().expect("gameshark state lock poisoned").is_some(),
+        "backend": backend,
+        "capture": parsed.capture,
+        "compiled_backends": {
+            "sqlite": true,
+            "mysql": cfg!(feature = "backend-mysql"),
+            "redis": cfg!(feature = "backend-redis")
+        },
+        "target": target.map(StorageTarget::status_target),
+        "sources": {
+            "storage": parsed.sources.storage,
+            "dsn": parsed.sources.dsn,
+            "legacy_db": parsed.sources.legacy_db,
+            "capture": parsed.sources.capture,
+            "credentials": parsed.sources.credentials,
+            "schema_mode": parsed.sources.schema_mode,
+            "timeouts": parsed.sources.timeouts
+        },
+        "schema": {
+            "mode": schema_mode,
+            "status": schema_status,
+            "version": null,
+            "required_version": 1,
+            "checked_at": null
+        },
+        "ignored_legacy_sqlite_path": parsed.ignored_legacy_sqlite_path,
+        "last_error": parsed.error
+    });
+    c_string_from_string(value.to_string())
+}
+
+#[no_mangle]
+pub extern "C" fn gameshark_core_storage_db_path(
+    storage_config: *const GamesharkCoreStorageConfig,
+) -> *mut c_char {
+    let parsed = parse_storage_config(storage_config);
+    let Some(StorageTarget::Sqlite { path }) = parsed.target else {
+        return std::ptr::null_mut();
+    };
+    c_string_from_string(path)
+}
+
+fn c_string_from_string(value: String) -> *mut c_char {
+    CString::new(value)
+        .unwrap_or_else(|error| {
+            let text = error.into_vec();
+            CString::new(String::from_utf8_lossy(&text).replace('\0', "\\0")).unwrap()
+        })
+        .into_raw()
+}
+
+fn parse_storage_config(config: *const GamesharkCoreStorageConfig) -> ParsedStorageConfig {
+    let raw = unsafe { config.as_ref() };
+    let (storage, storage_source) =
+        select_config(raw.map(|c| c.storage_ini), raw.map(|c| c.storage_env));
+    let (dsn, dsn_source) = select_config(raw.map(|c| c.dsn_ini), raw.map(|c| c.dsn_env));
+    let (legacy_db, legacy_source) =
+        select_config(raw.map(|c| c.legacy_db_ini), raw.map(|c| c.legacy_db_env));
+    let (capture_value, capture_source) =
+        select_config(raw.map(|c| c.capture_ini), raw.map(|c| c.capture_env));
+    let capture = capture_value.unwrap_or_else(|| "default".to_string());
+
+    let mut sources = StorageSources {
+        storage: storage_source.to_string(),
+        dsn: dsn_source.to_string(),
+        legacy_db: legacy_source.to_string(),
+        capture: if capture_source == "unset" {
+            "default".to_string()
+        } else {
+            capture_source.to_string()
+        },
+        credentials: "none".to_string(),
+        schema_mode: "not_applicable".to_string(),
+        timeouts: "default".to_string(),
+    };
+
+    if !valid_capture(&capture) {
+        return parsed_error(
+            capture,
+            sources,
+            "config_invalid_capture",
+            None,
+            "gameshark capture must match [A-Za-z0-9_.:-]{1,128}",
+            Some("Set gameshark.capture or GAMESHARK_CAPTURE to a short stable sample name."),
+        );
+    }
+
+    let storage_normalized = storage
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase());
+    let dsn_backend = dsn.as_deref().and_then(dsn_backend);
+    if dsn.is_some() && dsn_backend.is_none() {
+        return parsed_error(
+            capture,
+            sources,
+            "config_invalid_dsn",
+            None,
+            "gameshark.dsn must start with sqlite:, mysql://, redis://, or rediss://",
+            None,
+        );
+    }
+    if let (Some(storage), Some(dsn_backend)) = (storage_normalized.as_deref(), dsn_backend) {
+        if storage != dsn_backend {
+            return parsed_error(
+                capture,
+                sources,
+                "config_conflict",
+                Some(storage),
+                "explicit gameshark.storage does not match gameshark.dsn scheme",
+                Some("Use matching storage and DSN scheme, or omit gameshark.storage."),
+            );
+        }
+    }
+
+    let mysql_split = raw.is_some_and(any_mysql_split_config);
+    let redis_split = raw.is_some_and(any_redis_split_config);
+    if storage_normalized.is_none() && dsn_backend.is_none() && mysql_split && redis_split {
+        return parsed_error(
+            capture,
+            sources,
+            "config_conflict",
+            None,
+            "both MySQL and Redis split configuration values were provided",
+            Some("Set gameshark.storage explicitly when more than one backend has split settings."),
+        );
+    }
+
+    let selected_backend = if let Some(storage) = storage_normalized.as_deref() {
+        match storage {
+            "sqlite" | "mysql" | "redis" => Some(storage.to_string()),
+            _ => {
+                return parsed_error(
+                    capture,
+                    sources,
+                    "config_invalid_storage",
+                    None,
+                    "gameshark.storage must be sqlite, mysql, or redis",
+                    None,
+                )
+            }
+        }
+    } else if let Some(backend) = dsn_backend {
+        sources.storage = "dsn".to_string();
+        Some(backend.to_string())
+    } else if mysql_split {
+        sources.storage = "default".to_string();
+        Some("mysql".to_string())
+    } else if redis_split {
+        sources.storage = "default".to_string();
+        Some("redis".to_string())
+    } else if legacy_db.is_some() {
+        sources.storage = "legacy".to_string();
+        Some("sqlite".to_string())
+    } else {
+        None
+    };
+
+    let ignored_legacy_sqlite_path = if legacy_db.is_some()
+        && selected_backend
+            .as_deref()
+            .is_some_and(|backend| backend != "sqlite")
+    {
+        sources.legacy_db = "ignored".to_string();
+        legacy_db.as_deref().map(redact_path)
+    } else {
+        None
+    };
+
+    let Some(backend) = selected_backend.as_deref() else {
+        return ParsedStorageConfig {
+            target: None,
+            capture,
+            sources,
+            ignored_legacy_sqlite_path: None,
+            error: None,
+        };
+    };
+
+    let target = match backend {
+        "sqlite" => parse_sqlite_target(dsn.as_deref(), legacy_db.as_deref()),
+        "mysql" => parse_mysql_target(raw, dsn.as_deref(), &mut sources),
+        "redis" => parse_redis_target(raw, dsn.as_deref(), &mut sources),
+        _ => unreachable!(),
+    };
+
+    match target {
+        Ok(target) => ParsedStorageConfig {
+            target: Some(target),
+            capture,
+            sources,
+            ignored_legacy_sqlite_path,
+            error: None,
+        },
+        Err(mut error) => {
+            if error.backend.is_none() {
+                error.backend = Some(backend.to_string());
+            }
+            ParsedStorageConfig {
+                target: None,
+                capture,
+                sources,
+                ignored_legacy_sqlite_path,
+                error: Some(error),
+            }
+        }
+    }
+}
+
+fn select_config(
+    ini: Option<*const c_char>,
+    env: Option<*const c_char>,
+) -> (Option<String>, &'static str) {
+    let ini = ini
+        .and_then(c_string)
+        .filter(|value| config_has_value(value));
+    if ini.is_some() {
+        return (ini, "ini");
+    }
+    let env = env
+        .and_then(c_string)
+        .filter(|value| config_has_value(value));
+    if env.is_some() {
+        return (env, "env");
+    }
+    (None, "unset")
+}
+
+fn config_has_value(value: &str) -> bool {
+    value.chars().any(|ch| !ch.is_whitespace())
+}
+
+fn valid_capture(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+}
+
+fn parsed_error(
+    capture: String,
+    sources: StorageSources,
+    code: &str,
+    backend: Option<&str>,
+    message: &str,
+    hint: Option<&str>,
+) -> ParsedStorageConfig {
+    ParsedStorageConfig {
+        target: None,
+        capture,
+        sources,
+        ignored_legacy_sqlite_path: None,
+        error: Some(StorageError {
+            code: code.to_string(),
+            backend: backend.map(str::to_string),
+            message: message.to_string(),
+            hint: hint.map(str::to_string),
+        }),
+    }
+}
+
+fn dsn_backend(dsn: &str) -> Option<&'static str> {
+    if dsn.starts_with("sqlite:") {
+        Some("sqlite")
+    } else if dsn.starts_with("mysql://") {
+        Some("mysql")
+    } else if dsn.starts_with("redis://") || dsn.starts_with("rediss://") {
+        Some("redis")
+    } else {
+        None
+    }
+}
+
+fn parse_sqlite_target(
+    dsn: Option<&str>,
+    legacy_db: Option<&str>,
+) -> Result<StorageTarget, StorageError> {
+    let path = if let Some(dsn) = dsn {
+        parse_sqlite_dsn_path(dsn)?
+    } else {
+        legacy_db
+            .filter(|value| config_has_value(value))
+            .map(str::to_string)
+            .ok_or_else(|| StorageError {
+                code: "config_missing_sqlite_path".to_string(),
+                backend: Some("sqlite".to_string()),
+                message: "SQLite storage requires gameshark.db, GAMESHARK_DB, or sqlite: DSN"
+                    .to_string(),
+                hint: Some("Set gameshark.db=/path/to/gameshark.sqlite.".to_string()),
+            })?
+    };
+    Ok(StorageTarget::Sqlite { path })
+}
+
+fn parse_sqlite_dsn_path(dsn: &str) -> Result<String, StorageError> {
+    if !dsn.starts_with("sqlite:") {
+        return Err(StorageError {
+            code: "config_invalid_dsn".to_string(),
+            backend: Some("sqlite".to_string()),
+            message: "SQLite DSN must start with sqlite:".to_string(),
+            hint: None,
+        });
+    }
+    let rest = &dsn["sqlite:".len()..];
+    if let Some(after_slashes) = rest.strip_prefix("//") {
+        if !after_slashes.starts_with('/') {
+            return Err(StorageError {
+                code: "config_invalid_dsn".to_string(),
+                backend: Some("sqlite".to_string()),
+                message: "sqlite://host/path DSNs are not supported".to_string(),
+                hint: Some(
+                    "Use sqlite:/absolute/path, sqlite:///absolute/path, or sqlite:relative/path."
+                        .to_string(),
+                ),
+            });
+        }
+        return Ok(percent_decode_once(after_slashes));
+    }
+    if rest.is_empty() {
+        return Err(StorageError {
+            code: "config_missing_sqlite_path".to_string(),
+            backend: Some("sqlite".to_string()),
+            message: "SQLite DSN did not include a database path".to_string(),
+            hint: None,
+        });
+    }
+    Ok(percent_decode_once(rest))
+}
+
+fn parse_mysql_target(
+    raw: Option<&GamesharkCoreStorageConfig>,
+    dsn: Option<&str>,
+    sources: &mut StorageSources,
+) -> Result<StorageTarget, StorageError> {
+    if !cfg!(feature = "backend-mysql") {
+        return Err(StorageError {
+            code: "backend_not_compiled".to_string(),
+            backend: Some("mysql".to_string()),
+            message: "Gameshark was built without MySQL/MariaDB backend support".to_string(),
+            hint: Some("Rebuild with GAMESHARK_BACKENDS=all.".to_string()),
+        });
+    }
+    let schema_mode = select_config(
+        raw.map(|c| c.mysql_schema_mode_ini),
+        raw.map(|c| c.mysql_schema_mode_env),
+    );
+    sources.schema_mode = if schema_mode.1 == "unset" {
+        "default".to_string()
+    } else {
+        schema_mode.1.to_string()
+    };
+    let schema_mode = parse_schema_mode(schema_mode.0.as_deref(), SchemaMode::Validate)?;
+    let (connect_timeout_ms, operation_timeout_ms, report_timeout_ms, timeout_source) =
+        mysql_timeouts(raw)?;
+    sources.timeouts = timeout_source;
+
+    if let Some(dsn) = dsn {
+        if !dsn.starts_with("mysql://") {
+            return Err(StorageError {
+                code: "config_invalid_dsn".to_string(),
+                backend: Some("mysql".to_string()),
+                message: "MySQL/MariaDB DSN must start with mysql://".to_string(),
+                hint: None,
+            });
+        }
+        sources.credentials = if dsn_contains_credentials(dsn) {
+            "dsn"
+        } else {
+            "none"
+        }
+        .to_string();
+        return Ok(StorageTarget::Mysql {
+            dsn: strip_gameshark_query_params(dsn),
+            display: redact_dsn(dsn),
+            host: dsn_host(dsn),
+            port: dsn_port(dsn),
+            database: dsn_database(dsn),
+            socket: dsn_query_param(dsn, "socket"),
+            schema_mode,
+            connect_timeout_ms,
+            operation_timeout_ms,
+            report_timeout_ms,
+        });
+    }
+
+    let host = select_config(raw.map(|c| c.mysql_host_ini), raw.map(|c| c.mysql_host_env)).0;
+    let port = select_config(raw.map(|c| c.mysql_port_ini), raw.map(|c| c.mysql_port_env))
+        .0
+        .as_deref()
+        .map(parse_u16)
+        .transpose()?
+        .unwrap_or(3306);
+    let database = select_config(
+        raw.map(|c| c.mysql_database_ini),
+        raw.map(|c| c.mysql_database_env),
+    )
+    .0
+    .ok_or_else(|| StorageError {
+        code: "config_missing_database".to_string(),
+        backend: Some("mysql".to_string()),
+        message: "MySQL/MariaDB storage requires gameshark.mysql.database".to_string(),
+        hint: None,
+    })?;
+    let username = select_config(
+        raw.map(|c| c.mysql_username_ini),
+        raw.map(|c| c.mysql_username_env),
+    )
+    .0;
+    let password = selected_password(
+        raw.map(|c| c.mysql_password_ini),
+        raw.map(|c| c.mysql_password_env),
+        raw.map(|c| c.mysql_password_file_ini),
+        raw.map(|c| c.mysql_password_file_env),
+        &mut sources.credentials,
+        "mysql",
+    )?;
+    let socket = select_config(
+        raw.map(|c| c.mysql_socket_ini),
+        raw.map(|c| c.mysql_socket_env),
+    )
+    .0;
+    if sources.credentials == "none" && (username.is_some() || password.is_some()) {
+        sources.credentials = "split".to_string();
+    }
+    let dsn = build_mysql_dsn(
+        host.as_deref().unwrap_or("127.0.0.1"),
+        port,
+        &database,
+        username.as_deref(),
+        password.as_deref(),
+        socket.as_deref(),
+    );
+    let display = if let Some(socket) = socket.as_deref() {
+        format!(
+            "mysql://{}/{}?socket={}",
+            host.as_deref().unwrap_or("localhost"),
+            database,
+            socket
+        )
+    } else {
+        format!(
+            "mysql://{}:{}/{}",
+            host.as_deref().unwrap_or("127.0.0.1"),
+            port,
+            database
+        )
+    };
+    Ok(StorageTarget::Mysql {
+        dsn,
+        display,
+        host,
+        port: Some(port),
+        database: Some(database),
+        socket,
+        schema_mode,
+        connect_timeout_ms,
+        operation_timeout_ms,
+        report_timeout_ms,
+    })
+}
+
+fn parse_redis_target(
+    raw: Option<&GamesharkCoreStorageConfig>,
+    dsn: Option<&str>,
+    sources: &mut StorageSources,
+) -> Result<StorageTarget, StorageError> {
+    if !cfg!(feature = "backend-redis") {
+        return Err(StorageError {
+            code: "backend_not_compiled".to_string(),
+            backend: Some("redis".to_string()),
+            message: "Gameshark was built without Redis backend support".to_string(),
+            hint: Some("Rebuild with GAMESHARK_BACKENDS=all.".to_string()),
+        });
+    }
+    sources.schema_mode = "not_applicable".to_string();
+    let (connect_timeout_ms, operation_timeout_ms, report_timeout_ms, timeout_source) =
+        redis_timeouts(raw)?;
+    sources.timeouts = timeout_source;
+    let key_prefix = select_config(
+        raw.map(|c| c.redis_key_prefix_ini),
+        raw.map(|c| c.redis_key_prefix_env),
+    )
+    .0
+    .or_else(|| dsn.and_then(|value| dsn_query_param(value, "key_prefix")))
+    .unwrap_or_else(|| "gameshark".to_string());
+    if !valid_redis_key_prefix(&key_prefix) {
+        return Err(StorageError {
+            code: "config_invalid_key_prefix".to_string(),
+            backend: Some("redis".to_string()),
+            message: "Redis key prefix must match [A-Za-z0-9:_-]{1,80}".to_string(),
+            hint: None,
+        });
+    }
+    let ttl_value = select_config(raw.map(|c| c.redis_ttl_ini), raw.map(|c| c.redis_ttl_env))
+        .0
+        .or_else(|| dsn.and_then(|value| dsn_query_param(value, "ttl")));
+    let ttl = match ttl_value.as_deref() {
+        Some(value) => parse_u64(value).map_err(|message| StorageError {
+            code: "config_invalid_ttl".to_string(),
+            backend: Some("redis".to_string()),
+            message,
+            hint: None,
+        })?,
+        None => 3600,
+    };
+    if ttl < 60 {
+        return Err(StorageError {
+            code: "config_invalid_ttl".to_string(),
+            backend: Some("redis".to_string()),
+            message: "Redis ttl must be at least 60 seconds".to_string(),
+            hint: None,
+        });
+    }
+
+    if let Some(dsn) = dsn {
+        if dsn.starts_with("rediss://") && !cfg!(feature = "backend-redis") {
+            return Err(StorageError {
+                code: "backend_not_compiled".to_string(),
+                backend: Some("redis".to_string()),
+                message: "rediss:// requires Redis TLS support".to_string(),
+                hint: Some("Rebuild with GAMESHARK_BACKENDS=all.".to_string()),
+            });
+        }
+        if !dsn.starts_with("redis://") && !dsn.starts_with("rediss://") {
+            return Err(StorageError {
+                code: "config_invalid_dsn".to_string(),
+                backend: Some("redis".to_string()),
+                message: "Redis DSN must start with redis:// or rediss://".to_string(),
+                hint: None,
+            });
+        }
+        sources.credentials = if dsn_contains_credentials(dsn) {
+            "dsn"
+        } else {
+            "none"
+        }
+        .to_string();
+        return Ok(StorageTarget::Redis {
+            dsn: strip_gameshark_query_params(dsn),
+            display: redact_dsn(dsn),
+            host: dsn_host(dsn),
+            port: dsn_port(dsn),
+            database: dsn_database(dsn).and_then(|value| value.parse::<i64>().ok()),
+            key_prefix,
+            ttl,
+            connect_timeout_ms,
+            operation_timeout_ms,
+            report_timeout_ms,
+        });
+    }
+
+    let host = select_config(raw.map(|c| c.redis_host_ini), raw.map(|c| c.redis_host_env))
+        .0
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = select_config(raw.map(|c| c.redis_port_ini), raw.map(|c| c.redis_port_env))
+        .0
+        .as_deref()
+        .map(parse_u16)
+        .transpose()?
+        .unwrap_or(6379);
+    let database = select_config(
+        raw.map(|c| c.redis_database_ini),
+        raw.map(|c| c.redis_database_env),
+    )
+    .0
+    .as_deref()
+    .map(parse_i64)
+    .transpose()?
+    .unwrap_or(0);
+    let username = select_config(
+        raw.map(|c| c.redis_username_ini),
+        raw.map(|c| c.redis_username_env),
+    )
+    .0;
+    let password = selected_password(
+        raw.map(|c| c.redis_password_ini),
+        raw.map(|c| c.redis_password_env),
+        raw.map(|c| c.redis_password_file_ini),
+        raw.map(|c| c.redis_password_file_env),
+        &mut sources.credentials,
+        "redis",
+    )?;
+    if sources.credentials == "none" && (username.is_some() || password.is_some()) {
+        sources.credentials = "split".to_string();
+    }
+    let dsn = build_redis_dsn(
+        &host,
+        port,
+        database,
+        username.as_deref(),
+        password.as_deref(),
+    );
+    Ok(StorageTarget::Redis {
+        dsn,
+        display: format!("redis://{}:{}/{}", host, port, database),
+        host: Some(host),
+        port: Some(port),
+        database: Some(database),
+        key_prefix,
+        ttl,
+        connect_timeout_ms,
+        operation_timeout_ms,
+        report_timeout_ms,
+    })
+}
+
+fn any_mysql_split_config(config: &GamesharkCoreStorageConfig) -> bool {
+    [
+        config.mysql_host_ini,
+        config.mysql_host_env,
+        config.mysql_port_ini,
+        config.mysql_port_env,
+        config.mysql_database_ini,
+        config.mysql_database_env,
+        config.mysql_username_ini,
+        config.mysql_username_env,
+        config.mysql_password_ini,
+        config.mysql_password_env,
+        config.mysql_password_file_ini,
+        config.mysql_password_file_env,
+        config.mysql_socket_ini,
+        config.mysql_socket_env,
+    ]
+    .into_iter()
+    .filter_map(c_string)
+    .any(|value| config_has_value(&value))
+}
+
+fn any_redis_split_config(config: &GamesharkCoreStorageConfig) -> bool {
+    [
+        config.redis_host_ini,
+        config.redis_host_env,
+        config.redis_port_ini,
+        config.redis_port_env,
+        config.redis_database_ini,
+        config.redis_database_env,
+        config.redis_username_ini,
+        config.redis_username_env,
+        config.redis_password_ini,
+        config.redis_password_env,
+        config.redis_password_file_ini,
+        config.redis_password_file_env,
+        config.redis_key_prefix_ini,
+        config.redis_key_prefix_env,
+        config.redis_ttl_ini,
+        config.redis_ttl_env,
+    ]
+    .into_iter()
+    .filter_map(c_string)
+    .any(|value| config_has_value(&value))
+}
+
+fn parse_schema_mode(value: Option<&str>, default: SchemaMode) -> Result<SchemaMode, StorageError> {
+    match value.map(|value| value.trim().to_ascii_lowercase()) {
+        None => Ok(default),
+        Some(value) if value == "auto" => Ok(SchemaMode::Auto),
+        Some(value) if value == "validate" => Ok(SchemaMode::Validate),
+        _ => Err(StorageError {
+            code: "config_invalid_schema_mode".to_string(),
+            backend: Some("mysql".to_string()),
+            message: "MySQL schema mode must be auto or validate".to_string(),
+            hint: None,
+        }),
+    }
+}
+
+fn selected_password(
+    password_ini: Option<*const c_char>,
+    password_env: Option<*const c_char>,
+    password_file_ini: Option<*const c_char>,
+    password_file_env: Option<*const c_char>,
+    credential_source: &mut String,
+    backend: &str,
+) -> Result<Option<String>, StorageError> {
+    let (password_file, password_file_source) = select_config(password_file_ini, password_file_env);
+    if let Some(path) = password_file {
+        *credential_source = "password_file".to_string();
+        return read_password_file(&path, backend)
+            .map(Some)
+            .map_err(|message| StorageError {
+                code: "config_secret_error".to_string(),
+                backend: Some(backend.to_string()),
+                message,
+                hint: Some(
+                    "Fix gameshark.*.password_file permissions/content, or remove it.".to_string(),
+                ),
+            });
+    }
+    let (password, password_source) = select_config(password_ini, password_env);
+    if password.is_some() {
+        *credential_source = if password_source == "unset" {
+            "none".to_string()
+        } else {
+            "split".to_string()
+        };
+    } else if password_file_source != "unset" {
+        *credential_source = "password_file".to_string();
+    }
+    Ok(password)
+}
+
+fn read_password_file(path: &str, backend: &str) -> Result<String, String> {
+    let metadata = std::fs::metadata(path).map_err(|_| {
+        format!(
+            "{backend} password_file could not be read: {}",
+            redact_path(path)
+        )
+    })?;
+    if metadata.len() > 65_536 {
+        return Err(format!(
+            "{backend} password_file is too large: {}",
+            redact_path(path)
+        ));
+    }
+    let mut value = std::fs::read_to_string(path).map_err(|_| {
+        format!(
+            "{backend} password_file could not be read: {}",
+            redact_path(path)
+        )
+    })?;
+    if value.ends_with("\r\n") {
+        value.truncate(value.len() - 2);
+    } else if value.ends_with('\n') || value.ends_with('\r') {
+        value.truncate(value.len() - 1);
+    }
+    if value.is_empty() {
+        return Err(format!(
+            "{backend} password_file is empty: {}",
+            redact_path(path)
+        ));
+    }
+    Ok(value)
+}
+
+fn mysql_timeouts(
+    raw: Option<&GamesharkCoreStorageConfig>,
+) -> Result<(u64, u64, u64, String), StorageError> {
+    parse_timeouts(
+        raw.map(|c| c.mysql_connect_timeout_ms_ini),
+        raw.map(|c| c.mysql_connect_timeout_ms_env),
+        raw.map(|c| c.mysql_operation_timeout_ms_ini),
+        raw.map(|c| c.mysql_operation_timeout_ms_env),
+        raw.map(|c| c.mysql_report_timeout_ms_ini),
+        raw.map(|c| c.mysql_report_timeout_ms_env),
+        (1000, 5000, 10000),
+        "mysql",
+    )
+}
+
+fn redis_timeouts(
+    raw: Option<&GamesharkCoreStorageConfig>,
+) -> Result<(u64, u64, u64, String), StorageError> {
+    parse_timeouts(
+        raw.map(|c| c.redis_connect_timeout_ms_ini),
+        raw.map(|c| c.redis_connect_timeout_ms_env),
+        raw.map(|c| c.redis_operation_timeout_ms_ini),
+        raw.map(|c| c.redis_operation_timeout_ms_env),
+        raw.map(|c| c.redis_report_timeout_ms_ini),
+        raw.map(|c| c.redis_report_timeout_ms_env),
+        (500, 2000, 10000),
+        "redis",
+    )
+}
+
+fn parse_timeouts(
+    connect_ini: Option<*const c_char>,
+    connect_env: Option<*const c_char>,
+    operation_ini: Option<*const c_char>,
+    operation_env: Option<*const c_char>,
+    report_ini: Option<*const c_char>,
+    report_env: Option<*const c_char>,
+    defaults: (u64, u64, u64),
+    backend: &str,
+) -> Result<(u64, u64, u64, String), StorageError> {
+    let (connect, connect_source) = select_config(connect_ini, connect_env);
+    let (operation, operation_source) = select_config(operation_ini, operation_env);
+    let (report, report_source) = select_config(report_ini, report_env);
+    let connect = connect
+        .as_deref()
+        .map(parse_timeout_ms)
+        .transpose()
+        .map_err(|message| timeout_error(backend, message))?
+        .unwrap_or(defaults.0);
+    let operation = operation
+        .as_deref()
+        .map(parse_timeout_ms)
+        .transpose()
+        .map_err(|message| timeout_error(backend, message))?
+        .unwrap_or(defaults.1);
+    let report = report
+        .as_deref()
+        .map(parse_timeout_ms)
+        .transpose()
+        .map_err(|message| timeout_error(backend, message))?
+        .unwrap_or(defaults.2);
+    let mut sources = HashSet::new();
+    for source in [connect_source, operation_source, report_source] {
+        sources.insert(if source == "unset" { "default" } else { source });
+    }
+    let source = if sources.len() == 1 {
+        sources.into_iter().next().unwrap().to_string()
+    } else {
+        "mixed".to_string()
+    };
+    Ok((connect, operation, report, source))
+}
+
+fn timeout_error(backend: &str, message: String) -> StorageError {
+    StorageError {
+        code: "config_invalid_timeout".to_string(),
+        backend: Some(backend.to_string()),
+        message,
+        hint: Some("Timeouts must be integer milliseconds from 1 to 60000.".to_string()),
+    }
+}
+
+fn parse_timeout_ms(value: &str) -> Result<u64, String> {
+    let parsed = parse_u64(value)?;
+    if (1..=60_000).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(format!(
+            "timeout {parsed} is outside the supported range 1..60000"
+        ))
+    }
+}
+
+fn parse_u16(value: &str) -> Result<u16, StorageError> {
+    value.trim().parse::<u16>().map_err(|_| StorageError {
+        code: "config_invalid_port".to_string(),
+        backend: None,
+        message: format!("invalid port value {value:?}"),
+        hint: None,
+    })
+}
+
+fn parse_i64(value: &str) -> Result<i64, StorageError> {
+    value.trim().parse::<i64>().map_err(|_| StorageError {
+        code: "config_invalid_database".to_string(),
+        backend: None,
+        message: format!("invalid database value {value:?}"),
+        hint: None,
+    })
+}
+
+fn parse_u64(value: &str) -> Result<u64, String> {
+    value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("invalid unsigned integer value {value:?}"))
+}
+
+fn valid_redis_key_prefix(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
+}
+
+fn build_mysql_dsn(
+    host: &str,
+    port: u16,
+    database: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    socket: Option<&str>,
+) -> String {
+    let auth = match (username, password) {
+        (Some(user), Some(password)) => {
+            format!("{}:{}@", percent_encode(user), percent_encode(password))
+        }
+        (Some(user), None) => format!("{}@", percent_encode(user)),
+        _ => String::new(),
+    };
+    let mut dsn = format!(
+        "mysql://{}{}:{}/{}",
+        auth,
+        host,
+        port,
+        percent_encode(database)
+    );
+    if let Some(socket) = socket {
+        dsn.push_str("?socket=");
+        dsn.push_str(&percent_encode(socket));
+    }
+    dsn
+}
+
+fn build_redis_dsn(
+    host: &str,
+    port: u16,
+    database: i64,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let auth = match (username, password) {
+        (Some(user), Some(password)) => {
+            format!("{}:{}@", percent_encode(user), percent_encode(password))
+        }
+        (None, Some(password)) => format!(":{}@", percent_encode(password)),
+        (Some(user), None) => format!("{}@", percent_encode(user)),
+        _ => String::new(),
+    };
+    format!("redis://{}{}:{}/{}", auth, host, port, database)
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+fn percent_decode_once(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                out.push((high << 4) | low);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn dsn_contains_credentials(dsn: &str) -> bool {
+    dsn.find("://")
+        .and_then(|start| dsn[start + 3..].find('@'))
+        .is_some()
+}
+
+fn redact_dsn(dsn: &str) -> String {
+    let Some(scheme_end) = dsn.find("://") else {
+        return dsn.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let Some(at_offset) = dsn[authority_start..].find('@') else {
+        return dsn.to_string();
+    };
+    let at = authority_start + at_offset;
+    format!(
+        "{}<credentials>@{}",
+        &dsn[..authority_start],
+        &dsn[at + 1..]
+    )
+}
+
+fn redact_path(path: &str) -> String {
+    path.to_string()
+}
+
+fn strip_gameshark_query_params(dsn: &str) -> String {
+    let Some(query_start) = dsn.find('?') else {
+        return dsn.to_string();
+    };
+    let base = &dsn[..query_start];
+    let query = &dsn[query_start + 1..];
+    let kept: Vec<_> = query
+        .split('&')
+        .filter(|part| {
+            let key = part.split_once('=').map(|(key, _)| key).unwrap_or(part);
+            !matches!(key, "ssl_mode" | "key_prefix" | "ttl")
+        })
+        .collect();
+    if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    }
+}
+
+fn dsn_query_param(dsn: &str, name: &str) -> Option<String> {
+    let query = dsn.split_once('?')?.1;
+    for part in query.split('&') {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        if key == name {
+            return Some(percent_decode_once(value));
+        }
+    }
+    None
+}
+
+fn dsn_host(dsn: &str) -> Option<String> {
+    let rest = dsn.split_once("://")?.1;
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let host = host_port.split(':').next().unwrap_or_default();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+fn dsn_port(dsn: &str) -> Option<u16> {
+    let rest = dsn.split_once("://")?.1;
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    host_port.rsplit_once(':')?.1.parse::<u16>().ok()
+}
+
+fn dsn_database(dsn: &str) -> Option<String> {
+    let rest = dsn.split_once("://")?.1;
+    let path = rest.split_once('/')?.1;
+    let database = path.split('?').next().unwrap_or_default();
+    if database.is_empty() {
+        None
+    } else {
+        Some(percent_decode_once(database))
+    }
+}
+
+impl StorageTarget {
+    fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Sqlite { .. } => "sqlite",
+            Self::Mysql { .. } => "mysql",
+            Self::Redis { .. } => "redis",
+        }
+    }
+
+    fn schema_mode_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Mysql { schema_mode, .. } => Some(schema_mode.as_str()),
+            _ => None,
+        }
+    }
+
+    fn status_target(&self) -> serde_json::Value {
+        match self {
+            Self::Sqlite { path } => serde_json::json!({
+                "backend": "sqlite",
+                "display": path,
+                "path": path,
+                "host": null,
+                "port": null,
+                "database": null,
+                "socket": null,
+                "key_prefix": null
+            }),
+            Self::Mysql {
+                display,
+                host,
+                port,
+                database,
+                socket,
+                ..
+            } => serde_json::json!({
+                "backend": "mysql",
+                "display": display,
+                "path": null,
+                "host": host,
+                "port": port,
+                "database": database,
+                "socket": socket,
+                "key_prefix": null
+            }),
+            Self::Redis {
+                display,
+                host,
+                port,
+                database,
+                key_prefix,
+                ..
+            } => serde_json::json!({
+                "backend": "redis",
+                "display": display,
+                "path": null,
+                "host": host,
+                "port": port,
+                "database": database,
+                "socket": null,
+                "key_prefix": key_prefix
+            }),
+        }
+    }
 }
 
 unsafe fn ffi_str(value: &GamesharkCoreStr) -> Option<String> {
@@ -1645,7 +3136,15 @@ fn initialize_unused_run(
 }
 
 fn flush_state(state: State) -> Result<(), String> {
-    let mut connection = open_db(&state.db_path)?;
+    match &state.storage {
+        StorageTarget::Sqlite { path } => flush_state_sqlite(&state, path),
+        StorageTarget::Mysql { .. } => flush_state_mysql(&state),
+        StorageTarget::Redis { .. } => flush_state_redis(&state),
+    }
+}
+
+fn flush_state_sqlite(state: &State, db_path: &str) -> Result<(), String> {
+    let mut connection = open_db(db_path)?;
     initialize_schema(&connection)?;
     let transaction = connection
         .transaction()
@@ -1670,10 +3169,10 @@ fn flush_state(state: State) -> Result<(), String> {
                     side,
                     state.started_at,
                     now(),
-                    state.php_version,
-                    state.sapi_name,
+                    state.php_version.as_str(),
+                    state.sapi_name.as_str(),
                     state.pid,
-                    state.script_filename
+                    state.script_filename.as_deref()
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -1707,15 +3206,15 @@ fn flush_state(state: State) -> Result<(), String> {
                 ",
                 params![
                     now_ns(),
-                    state.php_version,
-                    state.sapi_name,
+                    state.php_version.as_str(),
+                    state.sapi_name.as_str(),
                     state.pid,
-                    state.script_filename,
-                    state.trace_filter.mode,
-                    state.trace_filter.allow_pattern,
-                    state.trace_filter.allow_pattern_hash,
+                    state.script_filename.as_deref(),
+                    state.trace_filter.mode.as_str(),
+                    state.trace_filter.allow_pattern.as_deref(),
+                    state.trace_filter.allow_pattern_hash.as_deref(),
                     state.trace_filter.allow_pattern_valid,
-                    state.trace_filter.allow_pattern_error,
+                    state.trace_filter.allow_pattern_error.as_deref(),
                     state.trace_filter.counters.calls_seen,
                     state.trace_filter.counters.calls_allowed,
                     state.trace_filter.counters.calls_filtered_before_args,
@@ -1732,7 +3231,7 @@ fn flush_state(state: State) -> Result<(), String> {
         flush_unused_declarations(&transaction, run_id, &state.unused_declarations)?;
         flush_unused_accesses(&transaction, run_id, &state.unused_accesses)?;
         flush_unused_included_files(&transaction, run_id, &state.unused_included_files)?;
-        let mut caveats: Vec<_> = state.unused_caveats.into_iter().collect();
+        let mut caveats: Vec<_> = state.unused_caveats.iter().cloned().collect();
         caveats.sort();
         let caveats_json = serde_json::to_string(&caveats).map_err(|error| error.to_string())?;
         transaction
@@ -1750,10 +3249,10 @@ fn flush_state(state: State) -> Result<(), String> {
                 ",
                 params![
                     now_ns(),
-                    state.php_version,
-                    state.sapi_name,
+                    state.php_version.as_str(),
+                    state.sapi_name.as_str(),
                     state.pid,
-                    state.script_filename,
+                    state.script_filename.as_deref(),
                     caveats_json,
                     run_id
                 ],
@@ -1762,6 +3261,983 @@ fn flush_state(state: State) -> Result<(), String> {
     }
 
     transaction.commit().map_err(|error| error.to_string())
+}
+
+fn diff_payload_from_state(state: &State, side: &str, finished_at: i64) -> DiffPayload {
+    let mut functions: Vec<_> = state
+        .counters
+        .iter()
+        .map(|(function, call_count)| StoredFunctionCount {
+            function: function.clone(),
+            call_count: *call_count,
+        })
+        .collect();
+    functions.sort_by(|left, right| {
+        display_name(&left.function)
+            .cmp(&display_name(&right.function))
+            .then_with(|| left.function.file.cmp(&right.function.file))
+            .then_with(|| left.function.start_line.cmp(&right.function.start_line))
+    });
+    DiffPayload {
+        run_id: finished_at,
+        capture: state.capture.clone(),
+        side: side.to_string(),
+        started_at: state.started_at,
+        finished_at,
+        php_version: state.php_version.clone(),
+        sapi: state.sapi_name.clone(),
+        pid: state.pid,
+        script_filename: state.script_filename.clone(),
+        functions,
+    }
+}
+
+fn trace_run_report_from_state(state: &State, run_id: i64, finished_at: i64) -> TraceRunReport {
+    let transformed_values: Vec<_> = state
+        .transformed_values
+        .iter()
+        .map(|value| TransformedValueReport {
+            value_id: value.value_id,
+            parent_value_id: value.parent_value_id,
+            elapsed_ns: value.elapsed_ns,
+            transform_kind: value.transform_kind.clone(),
+            producer: display_name(&value.function),
+            scope_name: value.function.scope_name.clone(),
+            function_name: value.function.function_name.clone(),
+            file: value.function.file.clone(),
+            start_line: value.function.start_line,
+            end_line: value.function.end_line,
+            value: value.value.clone(),
+            preview: value.preview.clone(),
+        })
+        .collect();
+    let events: Vec<_> = state
+        .trace_events
+        .iter()
+        .map(|event| TraceEventReport {
+            event_index: event.event_index,
+            elapsed_ns: event.elapsed_ns,
+            kind: event.function.kind.as_str().to_string(),
+            display_name: display_name(&event.function),
+            scope_name: event.function.scope_name.clone(),
+            function_name: event.function.function_name.clone(),
+            file: event.function.file.clone(),
+            start_line: event.function.start_line,
+            end_line: event.function.end_line,
+            argument_path: event.argument_path.clone(),
+            zval_type: event.zval_type.clone(),
+            matched_value_id: event.matched_value_id,
+            match_kind: event.match_kind.clone(),
+            matched_value: event.matched_value.clone(),
+            preview: event.preview.clone(),
+            observed_value: event.observed_value.clone(),
+            stack: event
+                .stack
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect(),
+            stack_frames: serde_json::from_str(&event.stack_json)
+                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+        })
+        .collect();
+    TraceRunReport {
+        run_id,
+        started_at: state.started_at,
+        finished_at: Some(finished_at),
+        status: "complete".to_string(),
+        trace_value: state.trace_value.clone().unwrap_or_default(),
+        trace_value_kind: state
+            .trace_value_kind
+            .clone()
+            .unwrap_or_else(|| "string".to_string()),
+        php_version: state.php_version.clone(),
+        sapi: state.sapi_name.clone(),
+        pid: state.pid,
+        script_filename: state.script_filename.clone(),
+        trace_filter: TraceFilterReport {
+            mode: state.trace_filter.mode.clone(),
+            allow_pattern: state.trace_filter.allow_pattern.clone(),
+            allow_pattern_hash: state.trace_filter.allow_pattern_hash.clone(),
+            allow_pattern_valid: state.trace_filter.allow_pattern_valid,
+            allow_pattern_error: state.trace_filter.allow_pattern_error.clone(),
+            calls_seen: state.trace_filter.counters.calls_seen,
+            calls_allowed: state.trace_filter.counters.calls_allowed,
+            calls_filtered_before_args: state.trace_filter.counters.calls_filtered_before_args,
+            args_inspected: state.trace_filter.counters.args_inspected,
+            calls_with_value_matches: state.trace_filter.counters.calls_with_value_matches,
+            transform_frames_started: state.trace_filter.counters.transform_frames_started,
+        },
+        event_count: events.len(),
+        transformed_value_count: transformed_values.len(),
+        transformed_values,
+        events,
+    }
+}
+
+fn unused_snapshot_from_state(state: &State, run_id: i64, finished_at: i64) -> UnusedSnapshot {
+    let mut caveats: Vec<_> = state.unused_caveats.iter().cloned().collect();
+    caveats.sort();
+    let mut declarations: Vec<_> = state.unused_declarations.values().cloned().collect();
+    declarations.sort_by(|left, right| {
+        left.display_name
+            .cmp(&right.display_name)
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| left.start_line.cmp(&right.start_line))
+    });
+    let mut accesses: Vec<_> = state.unused_accesses.values().cloned().collect();
+    accesses.sort_by(|left, right| {
+        left.display_name
+            .cmp(&right.display_name)
+            .then_with(|| left.access_kind.as_str().cmp(right.access_kind.as_str()))
+    });
+    let mut included_files: Vec<_> = state
+        .unused_included_files
+        .iter()
+        .map(|(file, include_count)| UnusedIncludedFile {
+            file: file.clone(),
+            include_count: *include_count,
+        })
+        .collect();
+    included_files.sort_by(|left, right| left.file.cmp(&right.file));
+    UnusedSnapshot {
+        run: UnusedRunReport {
+            run_id,
+            started_at: state.started_at,
+            finished_at: Some(finished_at),
+            status: "complete".to_string(),
+            php_version: state.php_version.clone(),
+            sapi: state.sapi_name.clone(),
+            pid: state.pid,
+            script_filename: state.script_filename.clone(),
+            request_path: state.request_path.clone(),
+            request_uri_full: state.request_uri_full.clone(),
+            query_string: state.query_string.clone(),
+            new_opcode_handler_active: state.new_opcode_handler_active,
+            constant_opcode_handler_active: state.constant_opcode_handler_active,
+            class_constant_opcode_handler_active: state.class_constant_opcode_handler_active,
+            caveats,
+        },
+        declarations,
+        accesses,
+        included_files,
+    }
+}
+
+fn validate_storage_for_start(target: &StorageTarget) -> Result<(), StorageError> {
+    match target {
+        StorageTarget::Sqlite { .. } => Ok(()),
+        StorageTarget::Mysql { .. } => mysql_ensure_schema(target),
+        StorageTarget::Redis { .. } => redis_ping(target),
+    }
+}
+
+fn flush_state_mysql(state: &State) -> Result<(), String> {
+    mysql_flush_state(state).map_err(|error| error.message)
+}
+
+fn flush_state_redis(state: &State) -> Result<(), String> {
+    redis_flush_state(state).map_err(|error| error.message)
+}
+
+#[cfg(feature = "backend-mysql")]
+fn mysql_conn(target: &StorageTarget, report: bool) -> Result<mysql::PooledConn, StorageError> {
+    let StorageTarget::Mysql {
+        dsn,
+        connect_timeout_ms,
+        operation_timeout_ms,
+        report_timeout_ms,
+        ..
+    } = target
+    else {
+        unreachable!();
+    };
+    let opts = mysql::Opts::from_url(dsn).map_err(|error| {
+        storage_error(
+            "mysql",
+            "config_invalid_dsn",
+            error.to_string(),
+            Some("Check gameshark.dsn or gameshark.mysql.* settings."),
+        )
+    })?;
+    let io_timeout = if report {
+        *report_timeout_ms
+    } else {
+        *operation_timeout_ms
+    };
+    let builder = mysql::OptsBuilder::from_opts(opts)
+        .tcp_connect_timeout(Some(Duration::from_millis(*connect_timeout_ms)))
+        .read_timeout(Some(Duration::from_millis(io_timeout)))
+        .write_timeout(Some(Duration::from_millis(io_timeout)));
+    let pool = mysql::Pool::new(builder).map_err(|error| {
+        storage_error(
+            "mysql",
+            "connection_failed",
+            error.to_string(),
+            Some("Verify the MySQL/MariaDB host, database, and credentials."),
+        )
+    })?;
+    pool.get_conn().map_err(|error| {
+        storage_error(
+            "mysql",
+            "connection_failed",
+            error.to_string(),
+            Some("Verify the MySQL/MariaDB host, database, and credentials."),
+        )
+    })
+}
+
+#[cfg(feature = "backend-mysql")]
+fn mysql_ensure_schema(target: &StorageTarget) -> Result<(), StorageError> {
+    let StorageTarget::Mysql { schema_mode, .. } = target else {
+        unreachable!();
+    };
+    let mut conn = mysql_conn(target, false)?;
+    if *schema_mode == SchemaMode::Auto {
+        mysql_create_schema(&mut conn)?;
+        return Ok(());
+    }
+    let version: Result<Option<String>, mysql::Error> =
+        conn.query_first("SELECT value FROM schema_meta WHERE `key` = 'schema_version'");
+    match version {
+        Ok(Some(version)) if version == "1" => Ok(()),
+        Ok(_) => Err(storage_error(
+            "mysql",
+            "schema_invalid",
+            "MySQL/MariaDB Gameshark schema is missing or has an unsupported version".to_string(),
+            Some("Run the documented DDL, or set gameshark.mysql.schema_mode=auto for a disposable database."),
+        )),
+        Err(error) => Err(storage_error(
+            "mysql",
+            "schema_invalid",
+            error.to_string(),
+            Some("Run the documented DDL, or set gameshark.mysql.schema_mode=auto for a disposable database."),
+        )),
+    }
+}
+
+#[cfg(not(feature = "backend-mysql"))]
+fn mysql_ensure_schema(_target: &StorageTarget) -> Result<(), StorageError> {
+    Err(storage_error(
+        "mysql",
+        "backend_not_compiled",
+        "Gameshark was built without MySQL/MariaDB backend support".to_string(),
+        Some("Rebuild with GAMESHARK_BACKENDS=all."),
+    ))
+}
+
+#[cfg(feature = "backend-mysql")]
+fn mysql_create_schema(conn: &mut mysql::PooledConn) -> Result<(), StorageError> {
+    let statements = [
+        "CREATE TABLE IF NOT EXISTS schema_meta (`key` VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY, `value` VARCHAR(191) CHARACTER SET ascii COLLATE ascii_bin NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+        "CREATE TABLE IF NOT EXISTS diff_runs (run_id BIGINT NOT NULL PRIMARY KEY, capture VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, side VARCHAR(5) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, status VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, started_at BIGINT NOT NULL, finished_at BIGINT NULL, php_version VARCHAR(64), sapi VARCHAR(64), pid BIGINT, script_filename TEXT, payload_json LONGTEXT NOT NULL, KEY diff_capture_side_finished (capture, side, status, finished_at, run_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+        "CREATE TABLE IF NOT EXISTS trace_runs (run_id BIGINT NOT NULL PRIMARY KEY, capture VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, status VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, started_at BIGINT NOT NULL, finished_at BIGINT NULL, trace_value LONGTEXT, trace_value_kind VARCHAR(32), php_version VARCHAR(64), sapi VARCHAR(64), pid BIGINT, script_filename TEXT, payload_json LONGTEXT NOT NULL, KEY trace_capture_started (capture, status, started_at, run_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+        "CREATE TABLE IF NOT EXISTS unused_runs (run_id BIGINT NOT NULL PRIMARY KEY, capture VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, status VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, started_at BIGINT NOT NULL, finished_at BIGINT NULL, php_version VARCHAR(64), sapi VARCHAR(64), pid BIGINT, script_filename TEXT, request_path TEXT, payload_json LONGTEXT NOT NULL, KEY unused_capture_finished (capture, status, finished_at, run_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+    ];
+    for statement in statements {
+        conn.query_drop(statement).map_err(|error| {
+            storage_error("mysql", "schema_create_failed", error.to_string(), None)
+        })?;
+    }
+    conn.exec_drop(
+        "INSERT INTO schema_meta (`key`, `value`) VALUES ('schema_version', '1') ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)",
+        (),
+    )
+    .map_err(|error| storage_error("mysql", "schema_create_failed", error.to_string(), None))
+}
+
+#[cfg(feature = "backend-mysql")]
+fn mysql_flush_state(state: &State) -> Result<(), StorageError> {
+    mysql_ensure_schema(&state.storage)?;
+    let mut conn = mysql_conn(&state.storage, false)?;
+    let finished_at = now_ns();
+    let mut tx = conn
+        .start_transaction(mysql::TxOpts::default())
+        .map_err(|error| storage_error("mysql", "transaction_failed", error.to_string(), None))?;
+    if let Some(side) = state.side.as_deref() {
+        let payload = diff_payload_from_state(state, side, finished_at);
+        let payload_json = serde_json::to_string(&payload).map_err(|error| {
+            storage_error("mysql", "payload_encode_failed", error.to_string(), None)
+        })?;
+        tx.exec_drop(
+            "INSERT INTO diff_runs (run_id, capture, side, status, started_at, finished_at, php_version, sapi, pid, script_filename, payload_json) VALUES (?, ?, ?, 'complete', ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE status='complete', finished_at=VALUES(finished_at), payload_json=VALUES(payload_json)",
+            (
+                payload.run_id,
+                payload.capture.as_str(),
+                payload.side.as_str(),
+                payload.started_at,
+                payload.finished_at,
+                payload.php_version.as_str(),
+                payload.sapi.as_str(),
+                payload.pid,
+                payload.script_filename.as_deref(),
+                payload_json.as_str(),
+            ),
+        )
+        .map_err(|error| storage_error("mysql", "write_failed", error.to_string(), None))?;
+    }
+    if let Some(run_id) = state.trace_run_id {
+        let run = trace_run_report_from_state(state, run_id, finished_at);
+        let payload_json = serde_json::to_string(&run).map_err(|error| {
+            storage_error("mysql", "payload_encode_failed", error.to_string(), None)
+        })?;
+        tx.exec_drop(
+            "INSERT INTO trace_runs (run_id, capture, status, started_at, finished_at, trace_value, trace_value_kind, php_version, sapi, pid, script_filename, payload_json) VALUES (?, ?, 'complete', ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE status='complete', finished_at=VALUES(finished_at), payload_json=VALUES(payload_json)",
+            (
+                run.run_id,
+                state.capture.as_str(),
+                run.started_at,
+                run.finished_at,
+                run.trace_value.as_str(),
+                run.trace_value_kind.as_str(),
+                run.php_version.as_str(),
+                run.sapi.as_str(),
+                run.pid,
+                run.script_filename.as_deref(),
+                payload_json.as_str(),
+            ),
+        )
+        .map_err(|error| storage_error("mysql", "write_failed", error.to_string(), None))?;
+    }
+    if let Some(run_id) = state.unused_run_id {
+        let snapshot = unused_snapshot_from_state(state, run_id, finished_at);
+        let payload_json = serde_json::to_string(&snapshot).map_err(|error| {
+            storage_error("mysql", "payload_encode_failed", error.to_string(), None)
+        })?;
+        tx.exec_drop(
+            "INSERT INTO unused_runs (run_id, capture, status, started_at, finished_at, php_version, sapi, pid, script_filename, request_path, payload_json) VALUES (?, ?, 'complete', ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE status='complete', finished_at=VALUES(finished_at), payload_json=VALUES(payload_json)",
+            (
+                snapshot.run.run_id,
+                state.capture.as_str(),
+                snapshot.run.started_at,
+                snapshot.run.finished_at,
+                snapshot.run.php_version.as_str(),
+                snapshot.run.sapi.as_str(),
+                snapshot.run.pid,
+                snapshot.run.script_filename.as_deref(),
+                snapshot.run.request_path.as_deref(),
+                payload_json.as_str(),
+            ),
+        )
+        .map_err(|error| storage_error("mysql", "write_failed", error.to_string(), None))?;
+    }
+    tx.commit()
+        .map_err(|error| storage_error("mysql", "transaction_failed", error.to_string(), None))
+}
+
+#[cfg(not(feature = "backend-mysql"))]
+fn mysql_flush_state(_state: &State) -> Result<(), StorageError> {
+    Err(storage_error(
+        "mysql",
+        "backend_not_compiled",
+        "Gameshark was built without MySQL/MariaDB backend support".to_string(),
+        Some("Rebuild with GAMESHARK_BACKENDS=all."),
+    ))
+}
+
+#[cfg(feature = "backend-mysql")]
+fn mysql_compare_report(
+    target: &StorageTarget,
+    capture: &str,
+) -> Result<CompareReport, StorageError> {
+    mysql_ensure_schema(target)?;
+    let mut conn = mysql_conn(target, true)?;
+    let left = mysql_latest_diff_payload(&mut conn, capture, "left")?;
+    let right = mysql_latest_diff_payload(&mut conn, capture, "right")?;
+    Ok(compare_report_from_payloads(left.as_ref(), right.as_ref()))
+}
+
+#[cfg(not(feature = "backend-mysql"))]
+fn mysql_compare_report(
+    _target: &StorageTarget,
+    _capture: &str,
+) -> Result<CompareReport, StorageError> {
+    Err(storage_error(
+        "mysql",
+        "backend_not_compiled",
+        "Gameshark was built without MySQL/MariaDB backend support".to_string(),
+        Some("Rebuild with GAMESHARK_BACKENDS=all."),
+    ))
+}
+
+#[cfg(feature = "backend-mysql")]
+fn mysql_trace_report(target: &StorageTarget, capture: &str) -> Result<TraceReport, StorageError> {
+    mysql_ensure_schema(target)?;
+    let mut conn = mysql_conn(target, true)?;
+    let rows: Vec<String> = conn
+        .exec_map(
+            "SELECT payload_json FROM trace_runs WHERE capture = ? AND status = 'complete' ORDER BY started_at, run_id",
+            (capture,),
+            |payload_json: String| payload_json,
+        )
+        .map_err(|error| storage_error("mysql", "report_failed", error.to_string(), None))?;
+    let mut runs = Vec::new();
+    for row in rows {
+        runs.push(
+            serde_json::from_str::<TraceRunReport>(&row).map_err(|error| {
+                storage_error("mysql", "payload_decode_failed", error.to_string(), None)
+            })?,
+        );
+    }
+    Ok(trace_report_from_runs(runs))
+}
+
+#[cfg(not(feature = "backend-mysql"))]
+fn mysql_trace_report(
+    _target: &StorageTarget,
+    _capture: &str,
+) -> Result<TraceReport, StorageError> {
+    Err(storage_error(
+        "mysql",
+        "backend_not_compiled",
+        "Gameshark was built without MySQL/MariaDB backend support".to_string(),
+        Some("Rebuild with GAMESHARK_BACKENDS=all."),
+    ))
+}
+
+#[cfg(feature = "backend-mysql")]
+fn mysql_unused_report(
+    target: &StorageTarget,
+    capture: &str,
+    requested_run_id: i64,
+) -> Result<UnusedReport, StorageError> {
+    mysql_ensure_schema(target)?;
+    let mut conn = mysql_conn(target, true)?;
+    let run_count: u64 = conn
+        .exec_first(
+            "SELECT COUNT(*) FROM unused_runs WHERE capture = ?",
+            (capture,),
+        )
+        .map_err(|error| storage_error("mysql", "report_failed", error.to_string(), None))?
+        .unwrap_or(0);
+    let payload_json: Option<String> = if requested_run_id >= 0 {
+        conn.exec_first(
+            "SELECT payload_json FROM unused_runs WHERE capture = ? AND run_id = ?",
+            (capture, requested_run_id),
+        )
+    } else {
+        conn.exec_first(
+            "SELECT payload_json FROM unused_runs WHERE capture = ? AND status = 'complete' ORDER BY finished_at DESC, run_id DESC LIMIT 1",
+            (capture,),
+        )
+    }
+    .map_err(|error| storage_error("mysql", "report_failed", error.to_string(), None))?;
+    let Some(payload_json) = payload_json else {
+        return Err(storage_error(
+            "mysql",
+            "no_complete_run",
+            "no completed unused runs recorded for capture".to_string(),
+            None,
+        ));
+    };
+    let snapshot: UnusedSnapshot = serde_json::from_str(&payload_json).map_err(|error| {
+        storage_error("mysql", "payload_decode_failed", error.to_string(), None)
+    })?;
+    build_unused_report(
+        run_count as usize,
+        snapshot.run,
+        snapshot.declarations,
+        snapshot.accesses,
+        snapshot.included_files,
+    )
+    .map_err(|message| storage_error("mysql", "report_failed", message, None))
+}
+
+#[cfg(feature = "backend-mysql")]
+fn mysql_unused_aggregate_report(
+    target: &StorageTarget,
+    capture: &str,
+    since_run_id: i64,
+    until_run_id: i64,
+) -> Result<UnusedReport, StorageError> {
+    mysql_ensure_schema(target)?;
+    let mut conn = mysql_conn(target, true)?;
+    let mut query =
+        "SELECT payload_json FROM unused_runs WHERE capture = ? AND status = 'complete'"
+            .to_string();
+    if since_run_id >= 0 {
+        query.push_str(" AND run_id >= ");
+        query.push_str(&since_run_id.to_string());
+    }
+    if until_run_id >= 0 {
+        query.push_str(" AND run_id <= ");
+        query.push_str(&until_run_id.to_string());
+    }
+    query.push_str(" ORDER BY run_id");
+    let rows: Vec<String> = conn
+        .exec_map(query, (capture,), |payload_json: String| payload_json)
+        .map_err(|error| storage_error("mysql", "report_failed", error.to_string(), None))?;
+    let mut snapshots = Vec::new();
+    for row in rows {
+        snapshots.push(
+            serde_json::from_str::<UnusedSnapshot>(&row).map_err(|error| {
+                storage_error("mysql", "payload_decode_failed", error.to_string(), None)
+            })?,
+        );
+    }
+    aggregate_unused_snapshots(snapshots)
+        .map_err(|message| storage_error("mysql", "report_failed", message, None))
+}
+
+#[cfg(not(feature = "backend-mysql"))]
+fn mysql_unused_aggregate_report(
+    _target: &StorageTarget,
+    _capture: &str,
+    _since_run_id: i64,
+    _until_run_id: i64,
+) -> Result<UnusedReport, StorageError> {
+    Err(storage_error(
+        "mysql",
+        "backend_not_compiled",
+        "Gameshark was built without MySQL/MariaDB backend support".to_string(),
+        Some("Rebuild with GAMESHARK_BACKENDS=all."),
+    ))
+}
+
+#[cfg(not(feature = "backend-mysql"))]
+fn mysql_unused_report(
+    _target: &StorageTarget,
+    _capture: &str,
+    _requested_run_id: i64,
+) -> Result<UnusedReport, StorageError> {
+    Err(storage_error(
+        "mysql",
+        "backend_not_compiled",
+        "Gameshark was built without MySQL/MariaDB backend support".to_string(),
+        Some("Rebuild with GAMESHARK_BACKENDS=all."),
+    ))
+}
+
+#[cfg(feature = "backend-mysql")]
+fn mysql_latest_diff_payload(
+    conn: &mut mysql::PooledConn,
+    capture: &str,
+    side: &str,
+) -> Result<Option<DiffPayload>, StorageError> {
+    let payload_json: Option<String> = conn
+        .exec_first(
+            "SELECT payload_json FROM diff_runs WHERE capture = ? AND side = ? AND status = 'complete' ORDER BY finished_at DESC, run_id DESC LIMIT 1",
+            (capture, side),
+        )
+        .map_err(|error| storage_error("mysql", "report_failed", error.to_string(), None))?;
+    payload_json
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                storage_error("mysql", "payload_decode_failed", error.to_string(), None)
+            })
+        })
+        .transpose()
+}
+
+#[cfg(feature = "backend-redis")]
+fn redis_conn(target: &StorageTarget) -> Result<redis::Connection, StorageError> {
+    let StorageTarget::Redis {
+        dsn,
+        connect_timeout_ms: _,
+        ..
+    } = target
+    else {
+        unreachable!();
+    };
+    let client = redis::Client::open(dsn.as_str()).map_err(|error| {
+        storage_error(
+            "redis",
+            "config_invalid_dsn",
+            error.to_string(),
+            Some("Check gameshark.dsn or gameshark.redis.* settings."),
+        )
+    })?;
+    client.get_connection().map_err(|error| {
+        storage_error(
+            "redis",
+            "connection_failed",
+            error.to_string(),
+            Some("Verify the Redis host, database, and credentials."),
+        )
+    })
+}
+
+#[cfg(feature = "backend-redis")]
+fn redis_ping(target: &StorageTarget) -> Result<(), StorageError> {
+    let mut conn = redis_conn(target)?;
+    redis::cmd("PING")
+        .query::<String>(&mut conn)
+        .map(|_| ())
+        .map_err(|error| storage_error("redis", "connection_failed", error.to_string(), None))
+}
+
+#[cfg(not(feature = "backend-redis"))]
+fn redis_ping(_target: &StorageTarget) -> Result<(), StorageError> {
+    Err(storage_error(
+        "redis",
+        "backend_not_compiled",
+        "Gameshark was built without Redis backend support".to_string(),
+        Some("Rebuild with GAMESHARK_BACKENDS=all."),
+    ))
+}
+
+#[cfg(feature = "backend-redis")]
+fn redis_flush_state(state: &State) -> Result<(), StorageError> {
+    let StorageTarget::Redis {
+        key_prefix, ttl, ..
+    } = &state.storage
+    else {
+        unreachable!();
+    };
+    let mut conn = redis_conn(&state.storage)?;
+    let finished_at = now_ns();
+    if let Some(side) = state.side.as_deref() {
+        let payload = diff_payload_from_state(state, side, finished_at);
+        let payload_json = serde_json::to_string(&payload).map_err(|error| {
+            storage_error("redis", "payload_encode_failed", error.to_string(), None)
+        })?;
+        let key = redis_diff_key(key_prefix, &state.capture, side);
+        conn.set_ex::<_, _, ()>(key, payload_json, *ttl)
+            .map_err(|error| storage_error("redis", "write_failed", error.to_string(), None))?;
+    }
+    if let Some(run_id) = state.trace_run_id {
+        let run = trace_run_report_from_state(state, run_id, finished_at);
+        let payload_json = serde_json::to_string(&run).map_err(|error| {
+            storage_error("redis", "payload_encode_failed", error.to_string(), None)
+        })?;
+        let key = redis_trace_key(key_prefix, &state.capture, run_id);
+        let index = redis_trace_index_key(key_prefix, &state.capture);
+        conn.set_ex::<_, _, ()>(&key, payload_json, *ttl)
+            .map_err(|error| storage_error("redis", "write_failed", error.to_string(), None))?;
+        redis::cmd("ZADD")
+            .arg(&index)
+            .arg(run.started_at)
+            .arg(run_id)
+            .query::<()>(&mut conn)
+            .map_err(|error| storage_error("redis", "write_failed", error.to_string(), None))?;
+        conn.expire::<_, ()>(&index, *ttl as i64)
+            .map_err(|error| storage_error("redis", "write_failed", error.to_string(), None))?;
+    }
+    if let Some(run_id) = state.unused_run_id {
+        let snapshot = unused_snapshot_from_state(state, run_id, finished_at);
+        let payload_json = serde_json::to_string(&snapshot).map_err(|error| {
+            storage_error("redis", "payload_encode_failed", error.to_string(), None)
+        })?;
+        let key = redis_unused_key(key_prefix, &state.capture, run_id);
+        let index = redis_unused_index_key(key_prefix, &state.capture);
+        conn.set_ex::<_, _, ()>(&key, payload_json, *ttl)
+            .map_err(|error| storage_error("redis", "write_failed", error.to_string(), None))?;
+        redis::cmd("ZADD")
+            .arg(&index)
+            .arg(finished_at)
+            .arg(run_id)
+            .query::<()>(&mut conn)
+            .map_err(|error| storage_error("redis", "write_failed", error.to_string(), None))?;
+        conn.expire::<_, ()>(&index, *ttl as i64)
+            .map_err(|error| storage_error("redis", "write_failed", error.to_string(), None))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "backend-redis"))]
+fn redis_flush_state(_state: &State) -> Result<(), StorageError> {
+    Err(storage_error(
+        "redis",
+        "backend_not_compiled",
+        "Gameshark was built without Redis backend support".to_string(),
+        Some("Rebuild with GAMESHARK_BACKENDS=all."),
+    ))
+}
+
+#[cfg(feature = "backend-redis")]
+fn redis_compare_report(
+    target: &StorageTarget,
+    capture: &str,
+) -> Result<CompareReport, StorageError> {
+    let StorageTarget::Redis { key_prefix, .. } = target else {
+        unreachable!();
+    };
+    let mut conn = redis_conn(target)?;
+    let left =
+        redis_get_json::<DiffPayload>(&mut conn, &redis_diff_key(key_prefix, capture, "left"))?;
+    let right =
+        redis_get_json::<DiffPayload>(&mut conn, &redis_diff_key(key_prefix, capture, "right"))?;
+    Ok(compare_report_from_payloads(left.as_ref(), right.as_ref()))
+}
+
+#[cfg(not(feature = "backend-redis"))]
+fn redis_compare_report(
+    _target: &StorageTarget,
+    _capture: &str,
+) -> Result<CompareReport, StorageError> {
+    Err(storage_error(
+        "redis",
+        "backend_not_compiled",
+        "Gameshark was built without Redis backend support".to_string(),
+        Some("Rebuild with GAMESHARK_BACKENDS=all."),
+    ))
+}
+
+#[cfg(feature = "backend-redis")]
+fn redis_trace_report(target: &StorageTarget, capture: &str) -> Result<TraceReport, StorageError> {
+    let StorageTarget::Redis { key_prefix, .. } = target else {
+        unreachable!();
+    };
+    let mut conn = redis_conn(target)?;
+    let ids: Vec<i64> = conn
+        .zrange(redis_trace_index_key(key_prefix, capture), 0, -1)
+        .map_err(|error| storage_error("redis", "report_failed", error.to_string(), None))?;
+    let mut runs = Vec::new();
+    for run_id in ids {
+        if let Some(run) = redis_get_json::<TraceRunReport>(
+            &mut conn,
+            &redis_trace_key(key_prefix, capture, run_id),
+        )? {
+            runs.push(run);
+        }
+    }
+    Ok(trace_report_from_runs(runs))
+}
+
+#[cfg(not(feature = "backend-redis"))]
+fn redis_trace_report(
+    _target: &StorageTarget,
+    _capture: &str,
+) -> Result<TraceReport, StorageError> {
+    Err(storage_error(
+        "redis",
+        "backend_not_compiled",
+        "Gameshark was built without Redis backend support".to_string(),
+        Some("Rebuild with GAMESHARK_BACKENDS=all."),
+    ))
+}
+
+#[cfg(feature = "backend-redis")]
+fn redis_unused_report(
+    target: &StorageTarget,
+    capture: &str,
+    requested_run_id: i64,
+) -> Result<UnusedReport, StorageError> {
+    let StorageTarget::Redis { key_prefix, .. } = target else {
+        unreachable!();
+    };
+    let mut conn = redis_conn(target)?;
+    let ids: Vec<i64> = conn
+        .zrange(redis_unused_index_key(key_prefix, capture), 0, -1)
+        .map_err(|error| storage_error("redis", "report_failed", error.to_string(), None))?;
+    let selected = if requested_run_id >= 0 {
+        requested_run_id
+    } else {
+        *ids.last().ok_or_else(|| {
+            storage_error(
+                "redis",
+                "no_complete_run",
+                "no completed unused runs recorded for capture".to_string(),
+                None,
+            )
+        })?
+    };
+    let key = redis_unused_key(key_prefix, capture, selected);
+    let snapshot = redis_get_json::<UnusedSnapshot>(&mut conn, &key)?.ok_or_else(|| {
+        storage_error(
+            "redis",
+            "redis_data_expired",
+            "selected unused run is no longer present in Redis".to_string(),
+            Some("Increase gameshark.redis.ttl or use MySQL/MariaDB for durable collection."),
+        )
+    })?;
+    build_unused_report(
+        ids.len(),
+        snapshot.run,
+        snapshot.declarations,
+        snapshot.accesses,
+        snapshot.included_files,
+    )
+    .map_err(|message| storage_error("redis", "report_failed", message, None))
+}
+
+#[cfg(feature = "backend-redis")]
+fn redis_unused_aggregate_report(
+    target: &StorageTarget,
+    capture: &str,
+    since_run_id: i64,
+    until_run_id: i64,
+) -> Result<UnusedReport, StorageError> {
+    let StorageTarget::Redis { key_prefix, .. } = target else {
+        unreachable!();
+    };
+    let mut conn = redis_conn(target)?;
+    let mut ids: Vec<i64> = conn
+        .zrange(redis_unused_index_key(key_prefix, capture), 0, -1)
+        .map_err(|error| storage_error("redis", "report_failed", error.to_string(), None))?;
+    ids.retain(|run_id| {
+        (since_run_id < 0 || *run_id >= since_run_id)
+            && (until_run_id < 0 || *run_id <= until_run_id)
+    });
+    let mut snapshots = Vec::new();
+    for run_id in ids {
+        if let Some(snapshot) = redis_get_json::<UnusedSnapshot>(
+            &mut conn,
+            &redis_unused_key(key_prefix, capture, run_id),
+        )? {
+            snapshots.push(snapshot);
+        }
+    }
+    aggregate_unused_snapshots(snapshots)
+        .map_err(|message| storage_error("redis", "report_failed", message, None))
+}
+
+#[cfg(not(feature = "backend-redis"))]
+fn redis_unused_aggregate_report(
+    _target: &StorageTarget,
+    _capture: &str,
+    _since_run_id: i64,
+    _until_run_id: i64,
+) -> Result<UnusedReport, StorageError> {
+    Err(storage_error(
+        "redis",
+        "backend_not_compiled",
+        "Gameshark was built without Redis backend support".to_string(),
+        Some("Rebuild with GAMESHARK_BACKENDS=all."),
+    ))
+}
+
+#[cfg(not(feature = "backend-redis"))]
+fn redis_unused_report(
+    _target: &StorageTarget,
+    _capture: &str,
+    _requested_run_id: i64,
+) -> Result<UnusedReport, StorageError> {
+    Err(storage_error(
+        "redis",
+        "backend_not_compiled",
+        "Gameshark was built without Redis backend support".to_string(),
+        Some("Rebuild with GAMESHARK_BACKENDS=all."),
+    ))
+}
+
+#[cfg(feature = "backend-redis")]
+fn redis_get_json<T: for<'de> Deserialize<'de>>(
+    conn: &mut redis::Connection,
+    key: &str,
+) -> Result<Option<T>, StorageError> {
+    let value: Option<String> = conn
+        .get(key)
+        .map_err(|error| storage_error("redis", "report_failed", error.to_string(), None))?;
+    value
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                storage_error("redis", "payload_decode_failed", error.to_string(), None)
+            })
+        })
+        .transpose()
+}
+
+fn compare_report_from_payloads(
+    left: Option<&DiffPayload>,
+    right: Option<&DiffPayload>,
+) -> CompareReport {
+    let mut rows: HashMap<FunctionKey, (u64, u64)> = HashMap::new();
+    if let Some(left) = left {
+        for function in &left.functions {
+            rows.entry(function.function.clone()).or_default().0 = function.call_count;
+        }
+    }
+    if let Some(right) = right {
+        for function in &right.functions {
+            rows.entry(function.function.clone()).or_default().1 = function.call_count;
+        }
+    }
+    let mut report = CompareReport {
+        summary: CompareSummary {
+            left_total_calls: 0,
+            right_total_calls: 0,
+            left_function_count: 0,
+            right_function_count: 0,
+            changed_function_count: 0,
+        },
+        left_only: Vec::new(),
+        right_only: Vec::new(),
+        changed: Vec::new(),
+        same: Vec::new(),
+    };
+    let mut keys: Vec<_> = rows.into_iter().collect();
+    keys.sort_by(|(left, _), (right, _)| {
+        display_name(left)
+            .cmp(&display_name(right))
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| left.start_line.cmp(&right.start_line))
+    });
+    for (key, (left_count, right_count)) in keys {
+        report.summary.left_total_calls += left_count;
+        report.summary.right_total_calls += right_count;
+        if left_count > 0 {
+            report.summary.left_function_count += 1;
+        }
+        if right_count > 0 {
+            report.summary.right_function_count += 1;
+        }
+        let status = if left_count > 0 && right_count == 0 {
+            "left_only"
+        } else if right_count > 0 && left_count == 0 {
+            "right_only"
+        } else if left_count != right_count {
+            "changed"
+        } else {
+            "same"
+        };
+        let row = CompareRow {
+            status,
+            kind: key.kind.as_str().to_string(),
+            display_name: display_name(&key),
+            scope_name: key.scope_name,
+            function_name: key.function_name,
+            file: key.file,
+            start_line: key.start_line,
+            end_line: key.end_line,
+            left_count,
+            right_count,
+            delta: right_count as i64 - left_count as i64,
+        };
+        match status {
+            "left_only" => report.left_only.push(row),
+            "right_only" => report.right_only.push(row),
+            "changed" => {
+                report.summary.changed_function_count += 1;
+                report.changed.push(row);
+            }
+            _ => report.same.push(row),
+        }
+    }
+    report
+}
+
+fn trace_report_from_runs(runs: Vec<TraceRunReport>) -> TraceReport {
+    let event_count = runs.iter().map(|run| run.event_count).sum();
+    let transformed_value_count = runs.iter().map(|run| run.transformed_value_count).sum();
+    TraceReport {
+        summary: TraceSummary {
+            run_count: runs.len(),
+            event_count,
+            transformed_value_count,
+        },
+        runs,
+    }
+}
+
+fn redis_diff_key(prefix: &str, capture: &str, side: &str) -> String {
+    format!("{prefix}:v1:diff:{capture}:{side}")
+}
+
+fn redis_trace_index_key(prefix: &str, capture: &str) -> String {
+    format!("{prefix}:v1:trace-index:{capture}")
+}
+
+fn redis_trace_key(prefix: &str, capture: &str, run_id: i64) -> String {
+    format!("{prefix}:v1:trace:{capture}:{run_id}")
+}
+
+fn redis_unused_index_key(prefix: &str, capture: &str) -> String {
+    format!("{prefix}:v1:unused-index:{capture}")
+}
+
+fn redis_unused_key(prefix: &str, capture: &str, run_id: i64) -> String {
+    format!("{prefix}:v1:unused:{capture}:{run_id}")
 }
 
 fn flush_counts(
@@ -2011,6 +4487,29 @@ fn compare_json(db_path: &str) -> Result<String, String> {
     serde_json::to_string(&compare_report(db_path)?).map_err(|error| error.to_string())
 }
 
+fn compare_json_for_storage(target: &StorageTarget, capture: &str) -> Result<String, StorageError> {
+    serde_json::to_string(&compare_report_for_storage(target, capture)?).map_err(|error| {
+        storage_error(
+            target.backend_name(),
+            "report_encode_failed",
+            error.to_string(),
+            None,
+        )
+    })
+}
+
+fn compare_report_for_storage(
+    target: &StorageTarget,
+    capture: &str,
+) -> Result<CompareReport, StorageError> {
+    match target {
+        StorageTarget::Sqlite { path } => compare_report(path)
+            .map_err(|message| storage_error("sqlite", "report_failed", message, None)),
+        StorageTarget::Mysql { .. } => mysql_compare_report(target, capture),
+        StorageTarget::Redis { .. } => redis_compare_report(target, capture),
+    }
+}
+
 fn compare_report(db_path: &str) -> Result<CompareReport, String> {
     let connection = open_db(db_path)?;
     initialize_schema(&connection)?;
@@ -2109,6 +4608,32 @@ fn trace_report_json(db_path: &str) -> Result<String, String> {
     serde_json::to_string(&trace_report(db_path)?).map_err(|error| error.to_string())
 }
 
+fn trace_report_json_for_storage(
+    target: &StorageTarget,
+    capture: &str,
+) -> Result<String, StorageError> {
+    serde_json::to_string(&trace_report_for_storage(target, capture)?).map_err(|error| {
+        storage_error(
+            target.backend_name(),
+            "report_encode_failed",
+            error.to_string(),
+            None,
+        )
+    })
+}
+
+fn trace_report_for_storage(
+    target: &StorageTarget,
+    capture: &str,
+) -> Result<TraceReport, StorageError> {
+    match target {
+        StorageTarget::Sqlite { path } => trace_report(path)
+            .map_err(|message| storage_error("sqlite", "report_failed", message, None)),
+        StorageTarget::Mysql { .. } => mysql_trace_report(target, capture),
+        StorageTarget::Redis { .. } => redis_trace_report(target, capture),
+    }
+}
+
 fn trace_report(db_path: &str) -> Result<TraceReport, String> {
     let connection = open_db(db_path)?;
     initialize_schema(&connection)?;
@@ -2194,6 +4719,160 @@ fn unused_report_json(db_path: &str, requested_run_id: i64) -> Result<String, St
         .map_err(|error| error.to_string())
 }
 
+fn unused_report_json_for_storage(
+    target: &StorageTarget,
+    capture: &str,
+    requested_run_id: i64,
+) -> Result<String, StorageError> {
+    let report = unused_report_for_storage(target, capture, requested_run_id)?;
+    serde_json::to_string(&report).map_err(|error| {
+        storage_error(
+            target.backend_name(),
+            "report_encode_failed",
+            error.to_string(),
+            None,
+        )
+    })
+}
+
+fn unused_report_for_storage(
+    target: &StorageTarget,
+    capture: &str,
+    requested_run_id: i64,
+) -> Result<UnusedReport, StorageError> {
+    match target {
+        StorageTarget::Sqlite { path } => unused_report(path, requested_run_id)
+            .map_err(|message| storage_error("sqlite", "report_failed", message, None)),
+        StorageTarget::Mysql { .. } => mysql_unused_report(target, capture, requested_run_id),
+        StorageTarget::Redis { .. } => redis_unused_report(target, capture, requested_run_id),
+    }
+}
+
+fn unused_aggregate_report_for_storage(
+    target: &StorageTarget,
+    capture: &str,
+    since_run_id: i64,
+    until_run_id: i64,
+) -> Result<UnusedReport, StorageError> {
+    if since_run_id >= 0 && until_run_id >= 0 && since_run_id > until_run_id {
+        return Err(storage_error(
+            target.backend_name(),
+            "invalid_range",
+            "since_run_id must be less than or equal to until_run_id".to_string(),
+            None,
+        ));
+    }
+    match target {
+        StorageTarget::Sqlite { path } => {
+            sqlite_unused_aggregate_report(path, since_run_id, until_run_id)
+                .map_err(|message| storage_error("sqlite", "report_failed", message, None))
+        }
+        StorageTarget::Mysql { .. } => {
+            mysql_unused_aggregate_report(target, capture, since_run_id, until_run_id)
+        }
+        StorageTarget::Redis { .. } => {
+            redis_unused_aggregate_report(target, capture, since_run_id, until_run_id)
+        }
+    }
+}
+
+fn sqlite_unused_aggregate_report(
+    db_path: &str,
+    since_run_id: i64,
+    until_run_id: i64,
+) -> Result<UnusedReport, String> {
+    let connection = open_db(db_path)?;
+    initialize_schema(&connection)?;
+    let run_ids = sqlite_completed_unused_run_ids(&connection, since_run_id, until_run_id)?;
+    let mut snapshots = Vec::new();
+    for run_id in run_ids {
+        snapshots.push(UnusedSnapshot {
+            run: unused_run_for_id(&connection, run_id)?,
+            declarations: unused_declarations_for_run(&connection, run_id)?,
+            accesses: unused_accesses_for_run(&connection, run_id)?,
+            included_files: unused_included_files_for_run(&connection, run_id)?,
+        });
+    }
+    aggregate_unused_snapshots(snapshots)
+}
+
+fn sqlite_completed_unused_run_ids(
+    connection: &Connection,
+    since_run_id: i64,
+    until_run_id: i64,
+) -> Result<Vec<i64>, String> {
+    let mut sql = "SELECT run_id FROM unused_runs WHERE status = 'complete'".to_string();
+    if since_run_id >= 0 {
+        sql.push_str(" AND run_id >= ");
+        sql.push_str(&since_run_id.to_string());
+    }
+    if until_run_id >= 0 {
+        sql.push_str(" AND run_id <= ");
+        sql.push_str(&until_run_id.to_string());
+    }
+    sql.push_str(" ORDER BY run_id");
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|error| error.to_string())?;
+    let mut run_ids = Vec::new();
+    for row in rows {
+        run_ids.push(row.map_err(|error| error.to_string())?);
+    }
+    Ok(run_ids)
+}
+
+fn aggregate_unused_snapshots(snapshots: Vec<UnusedSnapshot>) -> Result<UnusedReport, String> {
+    let run_count = snapshots.len();
+    let mut declarations: HashMap<UnusedSymbolKey, UnusedDeclaration> = HashMap::new();
+    let mut accesses: HashMap<(UnusedSymbolKey, UnusedAccessKind), UnusedAccess> = HashMap::new();
+    let mut included_files: HashMap<String, u64> = HashMap::new();
+
+    for snapshot in snapshots {
+        for declaration in snapshot.declarations {
+            declarations
+                .entry(declaration.key.clone())
+                .or_insert(declaration);
+        }
+        for access in snapshot.accesses {
+            let key = (access.key.clone(), access.access_kind);
+            accesses
+                .entry(key)
+                .and_modify(|existing| existing.count = existing.count.saturating_add(access.count))
+                .or_insert(access);
+        }
+        for included_file in snapshot.included_files {
+            *included_files.entry(included_file.file).or_insert(0) += included_file.include_count;
+        }
+    }
+
+    let mut declarations: Vec<_> = declarations.into_values().collect();
+    declarations.sort_by(|left, right| {
+        left.display_name
+            .cmp(&right.display_name)
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| left.start_line.cmp(&right.start_line))
+    });
+    let mut accesses: Vec<_> = accesses.into_values().collect();
+    accesses.sort_by(|left, right| {
+        left.display_name
+            .cmp(&right.display_name)
+            .then_with(|| left.access_kind.as_str().cmp(right.access_kind.as_str()))
+    });
+    let mut included_files: Vec<_> = included_files
+        .into_iter()
+        .map(|(file, include_count)| UnusedIncludedFile {
+            file,
+            include_count,
+        })
+        .collect();
+    included_files.sort_by(|left, right| left.file.cmp(&right.file));
+
+    build_unused_report_from_parts(run_count, None, declarations, accesses, included_files)
+}
+
 fn unused_report(db_path: &str, requested_run_id: i64) -> Result<UnusedReport, String> {
     let connection = open_db(db_path)?;
     initialize_schema(&connection)?;
@@ -2207,6 +4886,27 @@ fn unused_report(db_path: &str, requested_run_id: i64) -> Result<UnusedReport, S
     let declarations = unused_declarations_for_run(&connection, run_id)?;
     let accesses = unused_accesses_for_run(&connection, run_id)?;
     let included_files = unused_included_files_for_run(&connection, run_id)?;
+    build_unused_report(run_count, run, declarations, accesses, included_files)
+}
+
+fn build_unused_report(
+    run_count: usize,
+    run: UnusedRunReport,
+    declarations: Vec<UnusedDeclaration>,
+    accesses: Vec<UnusedAccess>,
+    included_files: Vec<UnusedIncludedFile>,
+) -> Result<UnusedReport, String> {
+    build_unused_report_from_parts(run_count, Some(run), declarations, accesses, included_files)
+}
+
+fn build_unused_report_from_parts(
+    run_count: usize,
+    run: Option<UnusedRunReport>,
+    declarations: Vec<UnusedDeclaration>,
+    accesses: Vec<UnusedAccess>,
+    included_files: Vec<UnusedIncludedFile>,
+) -> Result<UnusedReport, String> {
+    let run_id = run.as_ref().map(|run| run.run_id);
     let mut declaration_by_key = HashMap::new();
     let mut class_flags_by_name = HashMap::new();
     for declaration in &declarations {
@@ -2327,7 +5027,7 @@ fn unused_report(db_path: &str, requested_run_id: i64) -> Result<UnusedReport, S
     Ok(UnusedReport {
         summary: UnusedSummary {
             run_count,
-            run_id: Some(run_id),
+            run_id,
             declaration_count: declarations.len(),
             access_count: accesses.len(),
             uncalled_function_count: uncalled_functions.len(),
@@ -2344,7 +5044,7 @@ fn unused_report(db_path: &str, requested_run_id: i64) -> Result<UnusedReport, S
                 included_files_with_no_accessed_declarations.len(),
             included_file_without_declaration_count: included_files_without_declarations.len(),
         },
-        run: Some(run),
+        run,
         uncalled_functions,
         uncalled_concrete_methods,
         classes_with_no_new_opcode_observed,

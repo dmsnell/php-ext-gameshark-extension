@@ -1,5 +1,7 @@
 GAMESHARK_CARGO_FLAGS ?= --locked
 
+.PHONY: $(builddir)/rust/target/release/libgameshark_core.a $(builddir)/rust/target/release/libgameshark_core.dylib
+
 $(builddir)/rust/target/release/libgameshark_core.a: $(srcdir)/rust/Cargo.toml $(srcdir)/rust/Cargo.lock $(srcdir)/rust/src/lib.rs
 	mkdir -p $(builddir)/rust/target
 	CARGO_TARGET_DIR=$(builddir)/rust/target $(CARGO) build --release $(GAMESHARK_CARGO_FLAGS) --manifest-path $(srcdir)/rust/Cargo.toml

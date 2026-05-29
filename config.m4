@@ -4,6 +4,13 @@ PHP_ARG_ENABLE([gameshark],
     [Enable gameshark support])],
   [no])
 
+PHP_ARG_WITH([gameshark-backends],
+  [which gameshark storage backends to compile],
+  [AS_HELP_STRING([--with-gameshark-backends=sqlite|all],
+    [Compile storage backends; sqlite is the default, all adds MySQL/MariaDB and Redis])],
+  [sqlite],
+  [no])
+
 if test "$PHP_GAMESHARK" != "no"; then
   if test -z "$PHP_CONFIG" || test ! -x "$PHP_CONFIG"; then
     AC_MSG_ERROR([php-config is required to build gameshark])
@@ -40,6 +47,22 @@ if test "$PHP_GAMESHARK" != "no"; then
     AC_MSG_ERROR([cargo is required to build gameshark])
   fi
 
+  AC_MSG_CHECKING([which gameshark storage backends to compile])
+  case "$PHP_GAMESHARK_BACKENDS" in
+    ""|yes|sqlite)
+      PHP_GAMESHARK_BACKENDS="sqlite"
+      GAMESHARK_CARGO_FLAGS='--locked'
+      ;;
+    all)
+      GAMESHARK_CARGO_FLAGS='--locked --no-default-features --features all'
+      ;;
+    *)
+      AC_MSG_ERROR([--with-gameshark-backends must be sqlite or all])
+      ;;
+  esac
+  AC_MSG_RESULT([$PHP_GAMESHARK_BACKENDS])
+  AC_DEFINE_UNQUOTED([GAMESHARK_COMPILED_BACKENDS], ["$PHP_GAMESHARK_BACKENDS"], [Compiled gameshark storage backends])
+
   GAMESHARK_RUST_STATIC_LIB='./rust/target/release/libgameshark_core.a'
   GAMESHARK_RUST_DYLIB='./rust/target/release/libgameshark_core.dylib'
   case $host_os in
@@ -63,6 +86,7 @@ if test "$PHP_GAMESHARK" != "no"; then
   GAMESHARK_SHARED_DEPENDENCIES="$GAMESHARK_SHARED_DEPENDENCIES $GAMESHARK_RUST_DEPENDENCY"
   GAMESHARK_SHARED_LIBADD="$GAMESHARK_SHARED_LIBADD $GAMESHARK_RUST_LINK_FLAGS $GAMESHARK_PLATFORM_LIBS"
   PHP_SUBST([CARGO])
+  PHP_SUBST([GAMESHARK_CARGO_FLAGS])
   PHP_SUBST([GAMESHARK_SHARED_DEPENDENCIES])
   PHP_SUBST([GAMESHARK_SHARED_LIBADD])
   PHP_ADD_MAKEFILE_FRAGMENT()

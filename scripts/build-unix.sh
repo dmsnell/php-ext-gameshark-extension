@@ -67,6 +67,16 @@ if [[ "$PHP_CONFIGURE_OPTIONS" == *"--enable-zts"* || "$PHP_CONFIGURE_OPTIONS" =
   exit 1
 fi
 
+GAMESHARK_BACKENDS="${GAMESHARK_BACKENDS:-sqlite}"
+case "$GAMESHARK_BACKENDS" in
+  sqlite|all)
+    ;;
+  *)
+    echo "GAMESHARK_BACKENDS must be sqlite or all" >&2
+    exit 1
+    ;;
+esac
+
 if ! command -v cargo >/dev/null 2>&1; then
   echo "cargo is required to build gameshark" >&2
   exit 1
@@ -95,7 +105,7 @@ done
 rm -f gameshark.la gameshark.lo modules/gameshark.so modules/gameshark.la .libs/gameshark.so .libs/gameshark.la
 
 "$PHPIZE"
-./configure --with-php-config="$PHP_CONFIG" --enable-gameshark
+./configure --with-php-config="$PHP_CONFIG" --enable-gameshark --with-gameshark-backends="$GAMESHARK_BACKENDS"
 make -j"$JOBS"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then

@@ -59,8 +59,65 @@ typedef struct {
 	uint32_t end_line;
 } gameshark_core_unused_access;
 
+typedef struct {
+	const char *storage_ini;
+	const char *storage_env;
+	const char *dsn_ini;
+	const char *dsn_env;
+	const char *legacy_db_ini;
+	const char *legacy_db_env;
+	const char *capture_ini;
+	const char *capture_env;
+	const char *mysql_host_ini;
+	const char *mysql_host_env;
+	const char *mysql_port_ini;
+	const char *mysql_port_env;
+	const char *mysql_database_ini;
+	const char *mysql_database_env;
+	const char *mysql_username_ini;
+	const char *mysql_username_env;
+	const char *mysql_password_ini;
+	const char *mysql_password_env;
+	const char *mysql_password_file_ini;
+	const char *mysql_password_file_env;
+	const char *mysql_socket_ini;
+	const char *mysql_socket_env;
+	const char *mysql_ssl_mode_ini;
+	const char *mysql_ssl_mode_env;
+	const char *mysql_schema_mode_ini;
+	const char *mysql_schema_mode_env;
+	const char *mysql_connect_timeout_ms_ini;
+	const char *mysql_connect_timeout_ms_env;
+	const char *mysql_operation_timeout_ms_ini;
+	const char *mysql_operation_timeout_ms_env;
+	const char *mysql_report_timeout_ms_ini;
+	const char *mysql_report_timeout_ms_env;
+	const char *redis_host_ini;
+	const char *redis_host_env;
+	const char *redis_port_ini;
+	const char *redis_port_env;
+	const char *redis_database_ini;
+	const char *redis_database_env;
+	const char *redis_username_ini;
+	const char *redis_username_env;
+	const char *redis_password_ini;
+	const char *redis_password_env;
+	const char *redis_password_file_ini;
+	const char *redis_password_file_env;
+	const char *redis_key_prefix_ini;
+	const char *redis_key_prefix_env;
+	const char *redis_ttl_ini;
+	const char *redis_ttl_env;
+	const char *redis_connect_timeout_ms_ini;
+	const char *redis_connect_timeout_ms_env;
+	const char *redis_operation_timeout_ms_ini;
+	const char *redis_operation_timeout_ms_env;
+	const char *redis_report_timeout_ms_ini;
+	const char *redis_report_timeout_ms_env;
+} gameshark_core_storage_config;
+
 int gameshark_core_request_start(
-	const char *db_path,
+	const gameshark_core_storage_config *storage_config,
 	const char *side,
 	const char *trace_value,
 	const char *trace_allow_pattern,
@@ -87,12 +144,17 @@ void gameshark_core_record_unused_access(const gameshark_core_unused_access *acc
 void gameshark_core_record_unused_included_file(const char *file);
 void gameshark_core_record_unused_caveat(const char *caveat);
 void gameshark_core_request_finish(void);
-char *gameshark_core_compare_json(const char *db_path);
-char *gameshark_core_compare_text(const char *db_path, int color);
-char *gameshark_core_trace_report_json(const char *db_path);
-char *gameshark_core_trace_report_text(const char *db_path, int color);
-char *gameshark_core_unused_report_json(const char *db_path, int64_t run_id);
-char *gameshark_core_unused_report_text(const char *db_path, int color, int64_t run_id);
+char *gameshark_core_last_error_json(void);
+char *gameshark_core_storage_status_json(const gameshark_core_storage_config *storage_config);
+char *gameshark_core_storage_db_path(const gameshark_core_storage_config *storage_config);
+char *gameshark_core_compare_json(const gameshark_core_storage_config *storage_config);
+char *gameshark_core_compare_text(const gameshark_core_storage_config *storage_config, int color);
+char *gameshark_core_trace_report_json(const gameshark_core_storage_config *storage_config);
+char *gameshark_core_trace_report_text(const gameshark_core_storage_config *storage_config, int color);
+char *gameshark_core_unused_report_json(const gameshark_core_storage_config *storage_config, int64_t run_id);
+char *gameshark_core_unused_report_text(const gameshark_core_storage_config *storage_config, int color, int64_t run_id);
+char *gameshark_core_unused_aggregate_report_json(const gameshark_core_storage_config *storage_config, const char *capture, int64_t since_run_id, int64_t until_run_id);
+char *gameshark_core_unused_aggregate_report_text(const gameshark_core_storage_config *storage_config, int color, const char *capture, int64_t since_run_id, int64_t until_run_id);
 void gameshark_core_string_free(char *ptr);
 
 #endif

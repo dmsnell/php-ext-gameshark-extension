@@ -2,7 +2,8 @@
 
 `gameshark` is a PHP extension for collecting differential and value-tracing
 data from PHP executions. The native extension is written in C and delegates
-SQLite-backed report storage to a Rust static library.
+report storage to a Rust library. SQLite is always available; MySQL/MariaDB and
+Redis are available in `GAMESHARK_BACKENDS=all` builds.
 
 ## Supported build targets
 
@@ -24,6 +25,13 @@ PHP_CONFIG=/path/to/php-config scripts/build-unix.sh
 The build script runs `phpize`, configures the extension, builds the Rust core
 with `cargo build --release --locked`, runs the PHPT suite, and performs a
 small load/trace smoke test.
+
+SQLite is the default compiled storage backend. Build with MySQL/MariaDB and
+Redis support when needed:
+
+```sh
+GAMESHARK_BACKENDS=all PHP_CONFIG=/path/to/php-config scripts/build-unix.sh
+```
 
 For the local checkout that contains the bundled `php-src` submodule, this is
 the usual command:
@@ -84,7 +92,8 @@ Unused runtime coverage mode:
 GAMESHARK_DB=/tmp/unused.sqlite GAMESHARK_UNUSED=1 php -d extension=gameshark.so script.php
 GAMESHARK_DB=/tmp/unused.sqlite php -d extension=gameshark.so -r 'echo gameshark_unused_report();'
 GAMESHARK_DB=/tmp/unused.sqlite php -d extension=gameshark.so -r 'echo gameshark_unused_report("json");'
-php -d memory_limit=-1 ../scripts/wp-unused-aggregate-report.php /tmp/unused.sqlite text
+GAMESHARK_DB=/tmp/unused.sqlite php -d extension=gameshark.so -r 'echo gameshark_unused_aggregate_report();'
+php -d extension=gameshark.so -d gameshark.db=/tmp/unused.sqlite scripts/gameshark-unused-aggregate-report.php json
 ```
 
 The unused report lists userland functions, concrete methods, classes, constants,
@@ -98,6 +107,40 @@ instrumented requests and use the aggregate helper to merge completed runs into
 one probabilistic coverage profile. The aggregate text and JSON reports are
 complete; use `GAMESHARK_COLOR=always` with the aggregate text command when
 writing ANSI output for `less -R`.
+
+Storage can also be configured with INI settings:
+
+```sh
+php -d extension=gameshark.so \
+  -d gameshark.storage=sqlite \
+  -d gameshark.dsn=sqlite:/tmp/run.sqlite \
+  -d gameshark.trace_value=needle \
+  script.php
+```
+
+For clustered production sampling, build with `GAMESHARK_BACKENDS=all` and use
+a dedicated MySQL/MariaDB database:
+
+```sh
+GAMESHARK_STORAGE=mysql
+GAMESHARK_DSN='mysql://gameshark:secret@db.example.test:3306/gameshark'
+GAMESHARK_CAPTURE=wp-prod-sample
+GAMESHARK_UNUSED=1
+```
+
+The default MySQL schema mode is `validate`; run the DDL from the top-level
+README or set `GAMESHARK_MYSQL_SCHEMA_MODE=auto` only for disposable databases.
+Redis is intended for temporary sampling:
+
+```sh
+GAMESHARK_STORAGE=redis
+GAMESHARK_DSN='redis://127.0.0.1:6379/4'
+GAMESHARK_REDIS_KEY_PREFIX=gameshark:dev
+GAMESHARK_REDIS_TTL=3600
+```
+
+Use `gameshark_storage_status()` to inspect the parsed backend, capture,
+compiled backends, redacted target, and configuration errors.
 
 Direct constant syntax and `constant('NAME')` count as value access;
 `defined()` checks are recorded as probes only. Included-file sections
