@@ -857,7 +857,7 @@ pub unsafe extern "C" fn gameshark_core_record_unused_declaration(
         return;
     };
     let scope_name = ffi_str(&declaration.scope_name).filter(|value| !value.is_empty());
-    let file = ffi_str(&declaration.file).filter(|value| !value.is_empty());
+    let incoming_file = ffi_str(&declaration.file).filter(|value| !value.is_empty());
     let key = unused_symbol_key(kind.clone(), scope_name.as_deref(), &name);
     let display_name = unused_display_name(&kind, scope_name.as_deref(), &name);
 
@@ -869,6 +869,23 @@ pub unsafe extern "C" fn gameshark_core_record_unused_declaration(
         return;
     }
 
+    let (file, start_line, end_line) = {
+        let previous = state.unused_declarations.get(&key);
+        (
+            incoming_file.or_else(|| previous.and_then(|value| value.file.clone())),
+            if declaration.start_line == 0 {
+                previous.map_or(0, |value| value.start_line)
+            } else {
+                declaration.start_line
+            },
+            if declaration.end_line == 0 {
+                previous.map_or(0, |value| value.end_line)
+            } else {
+                declaration.end_line
+            },
+        )
+    };
+
     state.unused_declarations.insert(
         key.clone(),
         UnusedDeclaration {
@@ -877,8 +894,8 @@ pub unsafe extern "C" fn gameshark_core_record_unused_declaration(
             scope_name,
             name,
             file,
-            start_line: declaration.start_line,
-            end_line: declaration.end_line,
+            start_line,
+            end_line,
             flags: declaration.flags,
         },
     );

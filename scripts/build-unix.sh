@@ -82,6 +82,16 @@ if [[ -z "${JOBS:-}" ]]; then
   JOBS="${JOBS:-2}"
 fi
 
+for PHPIZE_ARTIFACT in build run-tests.php; do
+  if [[ -e "$PHPIZE_ARTIFACT" ]]; then
+    chmod -R u+w "$PHPIZE_ARTIFACT" 2>/dev/null || {
+      echo "phpize generated artifact is not writable: $(pwd)/$PHPIZE_ARTIFACT" >&2
+      echo "Fix its ownership or remove ignored build artifacts before retrying." >&2
+      exit 1
+    }
+  fi
+done
+
 "$PHPIZE"
 ./configure --with-php-config="$PHP_CONFIG" --enable-gameshark
 make -j"$JOBS"

@@ -31,6 +31,18 @@
 #include <unistd.h>
 #include <stdarg.h>
 
+#ifndef zend_ini_string_literal
+# define zend_ini_string_literal(name) zend_ini_string((name), sizeof("" name) - 1, false)
+#endif
+
+#ifndef ZEND_VIRTUAL_PROPERTY_OFFSET
+# define ZEND_VIRTUAL_PROPERTY_OFFSET ((uint32_t)-1)
+#endif
+
+#ifndef IS_PROP_LAZY
+# define IS_PROP_LAZY 0
+#endif
+
 #define GAMESHARK_KIND_FUNCTION 1
 #define GAMESHARK_KIND_METHOD 2
 #define GAMESHARK_KIND_CLOSURE 3
@@ -955,7 +967,7 @@ static bool gameshark_load_invariants_file(const char *path)
 	ZVAL_UNDEF(&retval);
 	zend_file_handle file_handle;
 	zend_stream_init_filename(&file_handle, path);
-	zend_result result = zend_execute_script(ZEND_REQUIRE, &retval, &file_handle);
+	zend_result result = zend_execute_scripts(ZEND_REQUIRE, &retval, 1, &file_handle);
 	zend_destroy_file_handle(&file_handle);
 
 	if (result != SUCCESS) {
@@ -2752,11 +2764,15 @@ static void gameshark_unused_record_global_constants(void)
 			ZEND_CONSTANT_MODULE_NUMBER(constant) != PHP_USER_CONSTANT) {
 			continue;
 		}
+		zend_string *filename = NULL;
+#if PHP_VERSION_ID >= 80600
+		filename = constant->filename;
+#endif
 		gameshark_unused_record_declaration(
 			GAMESHARK_UNUSED_DECL_GLOBAL_CONSTANT,
 			NULL,
 			constant->name,
-			constant->filename,
+			filename,
 			0,
 			0,
 			ZEND_CONSTANT_FLAGS(constant)
@@ -2966,6 +2982,7 @@ static bool gameshark_unused_internal_function_supported(zend_function *function
 	}
 
 	return zend_string_equals_literal(function->common.function_name, "constant") ||
+		zend_string_equals_literal(function->common.function_name, "define") ||
 		zend_string_equals_literal(function->common.function_name, "defined");
 }
 
@@ -2981,6 +2998,23 @@ static void gameshark_unused_observe_internal(zend_execute_data *execute_data, z
 
 	zval *argument = ZEND_CALL_ARG(execute_data, 1);
 	if (Z_TYPE_P(argument) != IS_STRING) {
+		return;
+	}
+
+	if (zend_string_equals_literal(function->common.function_name, "define")) {
+		if (Z_TYPE_P(return_value) == IS_TRUE) {
+			zend_string *file = zend_get_executed_filename_ex();
+			uint32_t line = zend_get_executed_lineno();
+			gameshark_unused_record_declaration(
+				GAMESHARK_UNUSED_DECL_GLOBAL_CONSTANT,
+				NULL,
+				Z_STR_P(argument),
+				file,
+				line,
+				line,
+				0
+			);
+		}
 		return;
 	}
 

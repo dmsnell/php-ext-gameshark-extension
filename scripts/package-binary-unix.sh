@@ -139,9 +139,9 @@ ARTIFACT="$(pwd)/dist/$PACKAGE_NAME.tar.gz"
 tar -czf "$ARTIFACT" -C "$STAGE_PARENT" "$PACKAGE_NAME"
 
 if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum "$ARTIFACT" > "$ARTIFACT.sha256"
+  (cd "$(dirname "$ARTIFACT")" && sha256sum "$(basename "$ARTIFACT")" > "$(basename "$ARTIFACT").sha256")
 elif command -v shasum >/dev/null 2>&1; then
-  shasum -a 256 "$ARTIFACT" > "$ARTIFACT.sha256"
+  (cd "$(dirname "$ARTIFACT")" && shasum -a 256 "$(basename "$ARTIFACT")" > "$(basename "$ARTIFACT").sha256")
 fi
 
 printf 'created %s\n' "$ARTIFACT"
