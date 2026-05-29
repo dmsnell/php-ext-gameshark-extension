@@ -23,14 +23,13 @@ if [[ -z "$PHP_BIN" || ! -x "$PHP_BIN" ]]; then
   exit 1
 fi
 
-if [[ "$(uname -s)" == "Darwin" ]] && command -v nm >/dev/null 2>&1; then
-  UNRESOLVED_RUST_SYMBOLS="$(
-    nm -u "$EXTENSION" 2>/dev/null |
-      awk '/ U _?(_R|_ZN|rust_|serde|rusqlite|regex|aho_corasick|hashbrown|sqlite3_)/ { print }'
-  )"
-  if [[ -n "$UNRESOLVED_RUST_SYMBOLS" ]]; then
-    echo "extension has unresolved Rust dependency symbols; rebuild from clean ignored artifacts" >&2
-    echo "$UNRESOLVED_RUST_SYMBOLS" >&2
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  if command -v otool >/dev/null 2>&1 && ! otool -L "$EXTENSION" | grep -q 'libgameshark_core\.dylib'; then
+    echo "extension is not linked to libgameshark_core.dylib" >&2
+    exit 1
+  fi
+  if [[ ! -f "$(dirname "$EXTENSION")/libgameshark_core.dylib" ]]; then
+    echo "libgameshark_core.dylib must be next to gameshark.so on macOS" >&2
     exit 1
   fi
 fi

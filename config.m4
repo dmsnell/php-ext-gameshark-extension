@@ -50,7 +50,7 @@ if test "$PHP_GAMESHARK" != "no"; then
       ;;
     darwin*)
       GAMESHARK_RUST_DEPENDENCY="$GAMESHARK_RUST_DYLIB"
-      GAMESHARK_RUST_LINK_FLAGS="$GAMESHARK_RUST_DYLIB -Wl,-rpath,@loader_path"
+      GAMESHARK_RUST_LINK_FLAGS="-L./rust/target/release -lgameshark_core -Wl,-rpath,@loader_path"
       GAMESHARK_PLATFORM_LIBS="-lpthread -lm -framework Security -framework CoreFoundation -framework SystemConfiguration"
       ;;
     *)
