@@ -40,11 +40,14 @@ if test "$PHP_GAMESHARK" != "no"; then
     AC_MSG_ERROR([cargo is required to build gameshark])
   fi
 
+  GAMESHARK_RUST_LIB='./rust/target/release/libgameshark_core.a'
   case $host_os in
     linux*)
+      GAMESHARK_RUST_LINK_FLAGS="$GAMESHARK_RUST_LIB"
       GAMESHARK_PLATFORM_LIBS="-ldl -lpthread -lm"
       ;;
     darwin*)
+      GAMESHARK_RUST_LINK_FLAGS="-Wl,-force_load,$GAMESHARK_RUST_LIB"
       GAMESHARK_PLATFORM_LIBS="-lpthread -lm -framework Security -framework CoreFoundation -framework SystemConfiguration"
       ;;
     *)
@@ -54,9 +57,8 @@ if test "$PHP_GAMESHARK" != "no"; then
 
   PHP_NEW_EXTENSION([gameshark], [gameshark.c], [$ext_shared])
   PHP_ADD_EXTENSION_DEP(gameshark, json, true)
-  GAMESHARK_RUST_LIB='./rust/target/release/libgameshark_core.a'
   GAMESHARK_SHARED_DEPENDENCIES="$GAMESHARK_SHARED_DEPENDENCIES $GAMESHARK_RUST_LIB"
-  GAMESHARK_SHARED_LIBADD="$GAMESHARK_SHARED_LIBADD $GAMESHARK_RUST_LIB $GAMESHARK_PLATFORM_LIBS"
+  GAMESHARK_SHARED_LIBADD="$GAMESHARK_SHARED_LIBADD $GAMESHARK_RUST_LINK_FLAGS $GAMESHARK_PLATFORM_LIBS"
   PHP_SUBST([CARGO])
   PHP_SUBST([GAMESHARK_SHARED_DEPENDENCIES])
   PHP_SUBST([GAMESHARK_SHARED_LIBADD])
