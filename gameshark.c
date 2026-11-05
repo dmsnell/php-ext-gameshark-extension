@@ -76,6 +76,7 @@
 
 #define GAMESHARK_INVARIANT_TARGET_FUNCTION 1
 #define GAMESHARK_INVARIANT_TARGET_METHOD 2
+#define GAMESHARK_INVARIANT_TARGET_ALL 3
 #define GAMESHARK_INVARIANT_PHASE_PRE 1
 #define GAMESHARK_INVARIANT_PHASE_POST 2
 #define GAMESHARK_INVARIANT_RESOLVED_UNKNOWN 0
@@ -84,6 +85,8 @@
 #define GAMESHARK_INVARIANT_RESOLVED_INTERNAL_FUNCTION 3
 #define GAMESHARK_INVARIANT_RESOLVED_INTERNAL_METHOD 4
 #define GAMESHARK_INVARIANT_RESOLVED_UNSUPPORTED 5
+#define GAMESHARK_INVARIANT_RESOLVED_ALL_USER 6
+#define GAMESHARK_INVARIANT_MAX_CATCH_ALL 64
 
 #define GAMESHARK_UNUSED_DECL_FUNCTION 1
 #define GAMESHARK_UNUSED_DECL_METHOD 2
@@ -159,7 +162,19 @@ typedef struct {
 	bool matched;
 	uint64_t executions;
 	uint64_t hook_exceptions;
+	zend_string **files;
+	uint32_t file_count;
 } gameshark_invariant_spec;
+
+/*
+ * Which catch-all specs trap one function, found once per function and request.
+ * Bit i of a mask is the i-th catch-all spec.
+ */
+typedef struct {
+	zend_string *name;
+	uint64_t pre_mask;
+	uint64_t post_mask;
+} gameshark_catch_all_entry;
 
 typedef struct {
 	zend_execute_data *execute_data;
@@ -199,6 +214,9 @@ static size_t gameshark_invariant_spec_count = 0;
 static size_t gameshark_invariant_spec_capacity = 0;
 static gameshark_invariant_frame gameshark_invariant_frames[GAMESHARK_INVARIANT_MAX_ACTIVE_FRAMES];
 static size_t gameshark_invariant_frame_count = 0;
+static size_t gameshark_catch_all_specs[GAMESHARK_INVARIANT_MAX_CATCH_ALL];
+static size_t gameshark_catch_all_count = 0;
+static HashTable *gameshark_catch_all_functions = NULL;
 static uint64_t gameshark_invariant_reentrancy_suppressed = 0;
 static bool gameshark_invariant_has_internal_hooks = false;
 static bool gameshark_invariant_warn_builtins = true;
@@ -747,7 +765,19 @@ static void gameshark_reset_invariant_config(void)
 		if (gameshark_invariant_specs[i].match_key != NULL) {
 			zend_string_release(gameshark_invariant_specs[i].match_key);
 		}
+		for (uint32_t file = 0; file < gameshark_invariant_specs[i].file_count; file++) {
+			zend_string_release(gameshark_invariant_specs[i].files[file]);
+		}
+		if (gameshark_invariant_specs[i].files != NULL) {
+			efree(gameshark_invariant_specs[i].files);
+		}
 		zval_ptr_dtor(&gameshark_invariant_specs[i].hook);
+	}
+	gameshark_catch_all_count = 0;
+	if (gameshark_catch_all_functions != NULL) {
+		zend_hash_destroy(gameshark_catch_all_functions);
+		FREE_HASHTABLE(gameshark_catch_all_functions);
+		gameshark_catch_all_functions = NULL;
 	}
 	if (gameshark_invariant_specs != NULL) {
 		efree(gameshark_invariant_specs);
@@ -795,7 +825,8 @@ static bool gameshark_validate_spec_keys(HashTable *spec, uint32_t spec_index)
 			!zend_string_equals_literal(key, "id") &&
 			!zend_string_equals_literal(key, "target") &&
 			!zend_string_equals_literal(key, "when") &&
-			!zend_string_equals_literal(key, "hook")
+			!zend_string_equals_literal(key, "hook") &&
+			!zend_string_equals_literal(key, "files")
 		) {
 			gameshark_set_invariant_error("spec %u has unsupported key \"%s\"", spec_index, ZSTR_VAL(key));
 			return false;
@@ -822,6 +853,12 @@ static bool gameshark_normalize_invariant_target(
 	if (target_len == 0) {
 		gameshark_set_invariant_error("spec %u has an empty target", spec_index);
 		return false;
+	}
+	if (target_len == 1 && target_start[0] == '*') {
+		*target_kind = GAMESHARK_INVARIANT_TARGET_ALL;
+		*display_target = zend_string_init("*", 1, 0);
+		*match_key = zend_string_init("*", 1, 0);
+		return true;
 	}
 
 	const char *method_separator = gameshark_find_bytes(target_start, target_len, "::", 2);
@@ -860,6 +897,8 @@ static const char *gameshark_invariant_resolved_kind_name(uint8_t resolved_kind)
 			return "internal_method";
 		case GAMESHARK_INVARIANT_RESOLVED_UNSUPPORTED:
 			return "unsupported";
+		case GAMESHARK_INVARIANT_RESOLVED_ALL_USER:
+			return "all_user_functions";
 		case GAMESHARK_INVARIANT_RESOLVED_UNKNOWN:
 		default:
 			return "unknown";
@@ -892,6 +931,9 @@ static uint8_t gameshark_invariant_resolved_kind_for_function(zend_function *fun
 
 static uint8_t gameshark_resolve_invariant_spec_kind(gameshark_invariant_spec *spec)
 {
+	if (spec->target_kind == GAMESHARK_INVARIANT_TARGET_ALL) {
+		return GAMESHARK_INVARIANT_RESOLVED_ALL_USER;
+	}
 	if (spec->target_kind == GAMESHARK_INVARIANT_TARGET_FUNCTION) {
 		zend_function *function = zend_hash_find_ptr(EG(function_table), spec->match_key);
 		return gameshark_invariant_resolved_kind_for_function(function, spec->target_kind);
@@ -963,7 +1005,8 @@ static bool gameshark_append_invariant_spec(
 	zend_string *match_key,
 	uint8_t target_kind,
 	uint8_t phase,
-	zval *hook
+	zval *hook,
+	HashTable *files
 ) {
 	if (gameshark_invariant_spec_count == gameshark_invariant_spec_capacity) {
 		size_t new_capacity = gameshark_invariant_spec_capacity == 0 ? 8 : gameshark_invariant_spec_capacity * 2;
@@ -982,6 +1025,18 @@ static bool gameshark_append_invariant_spec(
 		spec->matched = false;
 		spec->executions = 0;
 		spec->hook_exceptions = 0;
+		spec->files = NULL;
+		spec->file_count = 0;
+		if (files != NULL && zend_hash_num_elements(files) > 0) {
+			spec->files = safe_emalloc(zend_hash_num_elements(files), sizeof(zend_string *), 0);
+			zval *file;
+			ZEND_HASH_FOREACH_VAL(files, file) {
+				spec->files[spec->file_count++] = zend_string_copy(Z_STR_P(file));
+			} ZEND_HASH_FOREACH_END();
+		}
+		if (target_kind == GAMESHARK_INVARIANT_TARGET_ALL) {
+			gameshark_catch_all_specs[gameshark_catch_all_count++] = gameshark_invariant_spec_count - 1;
+		}
 		return true;
 	}
 
@@ -1059,7 +1114,32 @@ static bool gameshark_validate_and_store_invariants(zval *config)
 			return false;
 		}
 
-		gameshark_append_invariant_spec(Z_STR_P(id_zv), target, match_key, target_kind, phase, hook_zv);
+		zval *files_zv = zend_hash_str_find(spec, "files", sizeof("files") - 1);
+		if (files_zv != NULL) {
+			bool valid_files = target_kind == GAMESHARK_INVARIANT_TARGET_ALL && Z_TYPE_P(files_zv) == IS_ARRAY;
+			if (valid_files) {
+				zval *file;
+				ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(files_zv), file) {
+					if (Z_TYPE_P(file) != IS_STRING || Z_STRLEN_P(file) == 0) {
+						valid_files = false;
+					}
+				} ZEND_HASH_FOREACH_END();
+			}
+			if (!valid_files) {
+				zend_string_release(target);
+				zend_string_release(match_key);
+				gameshark_set_invariant_error("spec %u files must be a list of non-empty path prefixes, for the target \"*\"", spec_index);
+				return false;
+			}
+		}
+		if (target_kind == GAMESHARK_INVARIANT_TARGET_ALL && gameshark_catch_all_count >= GAMESHARK_INVARIANT_MAX_CATCH_ALL) {
+			zend_string_release(target);
+			zend_string_release(match_key);
+			gameshark_set_invariant_error("spec %u is more than %d specs with the target \"*\"", spec_index, GAMESHARK_INVARIANT_MAX_CATCH_ALL);
+			return false;
+		}
+
+		gameshark_append_invariant_spec(Z_STR_P(id_zv), target, match_key, target_kind, phase, hook_zv, files_zv != NULL ? Z_ARRVAL_P(files_zv) : NULL);
 		zend_string_release(target);
 		zend_string_release(match_key);
 	} ZEND_HASH_FOREACH_END();
@@ -2658,6 +2738,148 @@ static void gameshark_run_pre_invariants(
 	}
 }
 
+static void gameshark_catch_all_entry_dtor(zval *value)
+{
+	gameshark_catch_all_entry *entry = Z_PTR_P(value);
+	if (entry->name != NULL) {
+		zend_string_release(entry->name);
+	}
+	efree(entry);
+}
+
+static bool gameshark_catch_all_file_matches(gameshark_invariant_spec *spec, zend_string *file)
+{
+	if (spec->file_count == 0) {
+		return true;
+	}
+	if (file == NULL) {
+		return false;
+	}
+	for (uint32_t i = 0; i < spec->file_count; i++) {
+		zend_string *prefix = spec->files[i];
+		if (ZSTR_LEN(file) >= ZSTR_LEN(prefix) && memcmp(ZSTR_VAL(file), ZSTR_VAL(prefix), ZSTR_LEN(prefix)) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Returns which catch-all specs trap a user function, or NULL when none do.
+ *
+ * The answer depends only on the function, so it is worked out on the first
+ * call and kept for the request, keyed by the function.
+ */
+static gameshark_catch_all_entry *gameshark_catch_all_entry_for(zend_function *function)
+{
+	if (gameshark_catch_all_count == 0 || !gameshark_invariant_user_function_supported(function)) {
+		return NULL;
+	}
+	if (gameshark_catch_all_functions == NULL) {
+		ALLOC_HASHTABLE(gameshark_catch_all_functions);
+		zend_hash_init(gameshark_catch_all_functions, 1024, NULL, gameshark_catch_all_entry_dtor, 0);
+	}
+
+	zend_ulong key = (zend_ulong) (uintptr_t) function;
+	gameshark_catch_all_entry *entry = zend_hash_index_find_ptr(gameshark_catch_all_functions, key);
+	if (entry == NULL) {
+		entry = emalloc(sizeof(gameshark_catch_all_entry));
+		entry->name = NULL;
+		entry->pre_mask = 0;
+		entry->post_mask = 0;
+		for (size_t i = 0; i < gameshark_catch_all_count; i++) {
+			gameshark_invariant_spec *spec = &gameshark_invariant_specs[gameshark_catch_all_specs[i]];
+			if (!gameshark_catch_all_file_matches(spec, function->op_array.filename)) {
+				continue;
+			}
+			if (spec->phase == GAMESHARK_INVARIANT_PHASE_PRE) {
+				entry->pre_mask |= ((uint64_t) 1) << i;
+			} else {
+				entry->post_mask |= ((uint64_t) 1) << i;
+			}
+		}
+		if (entry->pre_mask != 0 || entry->post_mask != 0) {
+			if (function->common.scope != NULL) {
+				smart_str name = {0};
+				smart_str_append(&name, function->common.scope->name);
+				smart_str_appends(&name, "::");
+				smart_str_append(&name, function->common.function_name);
+				smart_str_0(&name);
+				entry->name = name.s;
+			} else {
+				entry->name = zend_string_copy(function->common.function_name);
+			}
+		}
+		zend_hash_index_add_new_ptr(gameshark_catch_all_functions, key, entry);
+	}
+
+	return entry->pre_mask != 0 || entry->post_mask != 0 ? entry : NULL;
+}
+
+/*
+ * Runs the catch-all hooks of one phase, given the parameters they share.
+ */
+static void gameshark_run_catch_all_hooks(uint64_t mask, zval *params, uint32_t param_count)
+{
+	for (size_t i = 0; i < gameshark_catch_all_count; i++) {
+		if ((mask & (((uint64_t) 1) << i)) == 0) {
+			continue;
+		}
+
+		gameshark_invariant_spec *spec = &gameshark_invariant_specs[gameshark_catch_all_specs[i]];
+		gameshark_mark_invariant_spec_matched(spec, GAMESHARK_INVARIANT_RESOLVED_ALL_USER);
+		gameshark_call_invariant_hook(spec, params, param_count);
+		if (EG(exception)) {
+			return;
+		}
+	}
+}
+
+/*
+ * Runs the catch-all pre hooks of a call: hook(string $function, array $args, ?object $this).
+ */
+static void gameshark_run_catch_all_pre(zend_execute_data *execute_data, gameshark_catch_all_entry *entry, bool has_object)
+{
+	zval params[3];
+	ZVAL_STR_COPY(&params[0], entry->name);
+	gameshark_capture_call_args(execute_data, &params[1]);
+	if (has_object) {
+		ZVAL_COPY(&params[2], &execute_data->This);
+	} else {
+		ZVAL_NULL(&params[2]);
+	}
+
+	gameshark_run_catch_all_hooks(entry->pre_mask, params, 3);
+	for (uint32_t i = 0; i < 3; i++) {
+		zval_ptr_dtor(&params[i]);
+	}
+}
+
+/*
+ * Runs the catch-all post hooks of a call: hook(string $function, mixed $return, array $args, ?object $this).
+ */
+static void gameshark_run_catch_all_post(gameshark_catch_all_entry *entry, gameshark_invariant_frame *frame, zval *retval)
+{
+	zval params[4];
+	ZVAL_STR_COPY(&params[0], entry->name);
+	if (retval != NULL) {
+		ZVAL_COPY(&params[1], retval);
+	} else {
+		ZVAL_NULL(&params[1]);
+	}
+	ZVAL_COPY(&params[2], &frame->args);
+	if (frame->has_object) {
+		ZVAL_COPY(&params[3], &frame->object);
+	} else {
+		ZVAL_NULL(&params[3]);
+	}
+
+	gameshark_run_catch_all_hooks(entry->post_mask, params, 4);
+	for (uint32_t i = 0; i < 4; i++) {
+		zval_ptr_dtor(&params[i]);
+	}
+}
+
 static void gameshark_push_invariant_frame(zend_execute_data *execute_data, bool has_object)
 {
 	if (gameshark_invariant_frame_count >= GAMESHARK_INVARIANT_MAX_ACTIVE_FRAMES) {
@@ -2746,6 +2968,11 @@ static void gameshark_run_post_invariants(zend_execute_data *execute_data, zval 
 
 	uint8_t resolved_kind = gameshark_invariant_resolved_kind_for_function(function, target_kind);
 	gameshark_run_post_invariants_for_frame(match_key, target_kind, resolved_kind, frame, retval);
+
+	gameshark_catch_all_entry *entry = gameshark_catch_all_entry_for(function);
+	if (entry != NULL && entry->post_mask != 0 && !EG(exception)) {
+		gameshark_run_catch_all_post(entry, frame, retval);
+	}
 
 	gameshark_remove_invariant_frame(frame_index);
 	zend_string_release(match_key);
@@ -3067,6 +3294,10 @@ static zend_observer_fcall_handlers gameshark_observer_fcall_init(zend_execute_d
 			wants_invariant_end = gameshark_invariant_has_hook(match_key, target_kind, GAMESHARK_INVARIANT_PHASE_POST);
 			zend_string_release(match_key);
 		}
+		gameshark_catch_all_entry *entry = gameshark_catch_all_entry_for(function);
+		if (entry != NULL && entry->post_mask != 0) {
+			wants_invariant_end = true;
+		}
 	}
 
 	if (((gameshark_count_active || gameshark_unused_active) && function->type == ZEND_USER_FUNCTION) || gameshark_trace_active || wants_invariant_end) {
@@ -3085,19 +3316,32 @@ static void gameshark_execute_ex(zend_execute_data *execute_data)
 		gameshark_invariant_reentrancy_suppressed++;
 	} else if (gameshark_invariants_active && gameshark_invariant_user_function_supported(execute_data->func)) {
 		uint8_t target_kind;
+		bool push_frame = false;
+		bool has_object = execute_data->func->common.scope != NULL && Z_TYPE(execute_data->This) == IS_OBJECT;
 		zend_string *match_key = gameshark_invariant_function_match_key(execute_data->func, &target_kind);
 		if (match_key != NULL) {
-			bool has_object = target_kind == GAMESHARK_INVARIANT_TARGET_METHOD && Z_TYPE(execute_data->This) == IS_OBJECT;
 			uint8_t resolved_kind = gameshark_invariant_resolved_kind_for_function(execute_data->func, target_kind);
 			gameshark_run_pre_invariants(execute_data, match_key, target_kind, resolved_kind, has_object);
 			if (EG(exception)) {
 				zend_string_release(match_key);
 				return;
 			}
-			if (gameshark_invariant_has_hook(match_key, target_kind, GAMESHARK_INVARIANT_PHASE_POST)) {
-				gameshark_push_invariant_frame(execute_data, has_object);
-			}
+			push_frame = gameshark_invariant_has_hook(match_key, target_kind, GAMESHARK_INVARIANT_PHASE_POST);
 			zend_string_release(match_key);
+		}
+
+		gameshark_catch_all_entry *entry = gameshark_catch_all_entry_for(execute_data->func);
+		if (entry != NULL && entry->pre_mask != 0) {
+			gameshark_run_catch_all_pre(execute_data, entry, has_object);
+			if (EG(exception)) {
+				return;
+			}
+		}
+		if (entry != NULL && entry->post_mask != 0) {
+			push_frame = true;
+		}
+		if (push_frame) {
+			gameshark_push_invariant_frame(execute_data, has_object);
 		}
 	}
 
@@ -3652,7 +3896,19 @@ PHP_FUNCTION(gameshark_invariants_status)
 		array_init(&spec_status);
 		add_assoc_str(&spec_status, "id", zend_string_copy(spec->id));
 		add_assoc_str(&spec_status, "target", zend_string_copy(spec->target));
-		add_assoc_string(&spec_status, "target_kind", spec->target_kind == GAMESHARK_INVARIANT_TARGET_METHOD ? "method" : "function");
+		add_assoc_string(
+			&spec_status,
+			"target_kind",
+			spec->target_kind == GAMESHARK_INVARIANT_TARGET_ALL ? "all" : (spec->target_kind == GAMESHARK_INVARIANT_TARGET_METHOD ? "method" : "function")
+		);
+		if (spec->target_kind == GAMESHARK_INVARIANT_TARGET_ALL) {
+			zval files;
+			array_init(&files);
+			for (uint32_t file = 0; file < spec->file_count; file++) {
+				add_next_index_str(&files, zend_string_copy(spec->files[file]));
+			}
+			add_assoc_zval(&spec_status, "files", &files);
+		}
 		add_assoc_string(&spec_status, "when", spec->phase == GAMESHARK_INVARIANT_PHASE_PRE ? "pre" : "post");
 		add_assoc_string(&spec_status, "resolved_kind", gameshark_invariant_resolved_kind_name(spec->resolved_kind));
 		add_assoc_bool(&spec_status, "matched", spec->matched);
