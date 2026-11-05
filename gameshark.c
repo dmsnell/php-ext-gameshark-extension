@@ -2757,6 +2757,9 @@ static void gameshark_observer_begin(zend_execute_data *execute_data)
 	if (!gameshark_request_active || function == NULL || function->common.function_name == NULL) {
 		return;
 	}
+	if (gameshark_invariants_executing_hook) {
+		return;
+	}
 
 	gameshark_core_function_meta meta = gameshark_function_meta(function);
 
@@ -2798,7 +2801,7 @@ static void gameshark_observer_begin(zend_execute_data *execute_data)
 
 static void gameshark_observer_end(zend_execute_data *execute_data, zval *retval)
 {
-	if (gameshark_request_active && gameshark_trace_active && gameshark_trace_follow_transforms) {
+	if (gameshark_request_active && gameshark_trace_active && gameshark_trace_follow_transforms && !gameshark_invariants_executing_hook) {
 		gameshark_follow_return_transforms(execute_data, retval);
 	}
 
@@ -3050,11 +3053,12 @@ static zend_observer_fcall_handlers gameshark_observer_fcall_init(zend_execute_d
 		return (zend_observer_fcall_handlers){NULL, NULL};
 	}
 
-	if (gameshark_invariants_executing_hook) {
-		gameshark_invariant_reentrancy_suppressed++;
-		return (zend_observer_fcall_handlers){NULL, NULL};
-	}
-
+	/*
+	 * The engine keeps these handlers for every later call to the function, so
+	 * they cannot depend on whether a hook is running now: a function first called
+	 * from a hook would never get its post hooks. The handlers skip calls made
+	 * from hooks instead.
+	 */
 	bool wants_invariant_end = false;
 	if (gameshark_invariants_active && gameshark_invariant_user_function_supported(function)) {
 		uint8_t target_kind;
@@ -3077,7 +3081,9 @@ static zend_observer_fcall_handlers gameshark_observer_fcall_init(zend_execute_d
 
 static void gameshark_execute_ex(zend_execute_data *execute_data)
 {
-	if (gameshark_invariants_active && !gameshark_invariants_executing_hook && gameshark_invariant_user_function_supported(execute_data->func)) {
+	if (gameshark_invariants_active && gameshark_invariants_executing_hook && gameshark_invariant_user_function_supported(execute_data->func)) {
+		gameshark_invariant_reentrancy_suppressed++;
+	} else if (gameshark_invariants_active && gameshark_invariant_user_function_supported(execute_data->func)) {
 		uint8_t target_kind;
 		zend_string *match_key = gameshark_invariant_function_match_key(execute_data->func, &target_kind);
 		if (match_key != NULL) {
