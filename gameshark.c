@@ -1682,6 +1682,24 @@ static void gameshark_append_function_display(smart_str *stack, zend_function *f
 	}
 }
 
+/*
+ * Returns the argument at a zero-based position of a call.
+ *
+ * A userland function's arguments beyond those it declares are moved past its
+ * compiled variables and temporaries, as func_get_args() reads them.
+ */
+static zval *gameshark_call_arg(zend_execute_data *execute_data, uint32_t i)
+{
+	zend_function *function = execute_data->func;
+	if (function != NULL && ZEND_USER_CODE(function->type)) {
+		uint32_t first_extra_arg = function->op_array.num_args;
+		if (i >= first_extra_arg) {
+			return ZEND_CALL_VAR_NUM(execute_data, function->op_array.last_var + function->op_array.T + (i - first_extra_arg));
+		}
+	}
+	return ZEND_CALL_ARG(execute_data, i + 1);
+}
+
 static zend_string *gameshark_build_stack(zend_execute_data *execute_data, zend_string **stack_json)
 {
 	smart_str stack = {0};
@@ -1755,7 +1773,7 @@ static zend_string *gameshark_build_stack(zend_execute_data *execute_data, zend_
 		if (function != NULL) {
 			uint32_t num_args = ZEND_CALL_NUM_ARGS(frame);
 			for (uint32_t i = 0; i < num_args; i++) {
-				zval *argument = ZEND_CALL_ARG(frame, i + 1);
+				zval *argument = gameshark_call_arg(frame, i);
 				zend_string *path = strpprintf(0, "arg%u", i);
 				gameshark_match_context matches = {0};
 				zend_string *preview;
@@ -2079,7 +2097,7 @@ static uint64_t gameshark_trace_arguments(zend_execute_data *execute_data, games
 	};
 
 	for (uint32_t i = 0; i < num_args; i++) {
-		zval *argument = ZEND_CALL_ARG(execute_data, i + 1);
+		zval *argument = gameshark_call_arg(execute_data, i);
 		zend_string *path = strpprintf(0, "arg%u", i);
 		context.visited_array_count = 0;
 		context.visited_object_count = 0;
@@ -2512,24 +2530,6 @@ static void gameshark_mark_invariant_spec_matched(gameshark_invariant_spec *spec
 			gameshark_invariant_has_internal_hooks = true;
 		}
 	}
-}
-
-/*
- * Returns the argument at a zero-based position of a call.
- *
- * A userland function's arguments beyond those it declares are moved past its
- * compiled variables and temporaries, as func_get_args() reads them.
- */
-static zval *gameshark_call_arg(zend_execute_data *execute_data, uint32_t i)
-{
-	zend_function *function = execute_data->func;
-	if (function != NULL && ZEND_USER_CODE(function->type)) {
-		uint32_t first_extra_arg = function->op_array.num_args;
-		if (i >= first_extra_arg) {
-			return ZEND_CALL_VAR_NUM(execute_data, function->op_array.last_var + function->op_array.T + (i - first_extra_arg));
-		}
-	}
-	return ZEND_CALL_ARG(execute_data, i + 1);
 }
 
 static void gameshark_capture_call_args(zend_execute_data *execute_data, zval *args)
