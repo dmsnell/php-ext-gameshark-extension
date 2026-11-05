@@ -2514,12 +2514,30 @@ static void gameshark_mark_invariant_spec_matched(gameshark_invariant_spec *spec
 	}
 }
 
+/*
+ * Returns the argument at a zero-based position of a call.
+ *
+ * A userland function's arguments beyond those it declares are moved past its
+ * compiled variables and temporaries, as func_get_args() reads them.
+ */
+static zval *gameshark_call_arg(zend_execute_data *execute_data, uint32_t i)
+{
+	zend_function *function = execute_data->func;
+	if (function != NULL && ZEND_USER_CODE(function->type)) {
+		uint32_t first_extra_arg = function->op_array.num_args;
+		if (i >= first_extra_arg) {
+			return ZEND_CALL_VAR_NUM(execute_data, function->op_array.last_var + function->op_array.T + (i - first_extra_arg));
+		}
+	}
+	return ZEND_CALL_ARG(execute_data, i + 1);
+}
+
 static void gameshark_capture_call_args(zend_execute_data *execute_data, zval *args)
 {
 	array_init(args);
 	uint32_t argc = ZEND_CALL_NUM_ARGS(execute_data);
 	for (uint32_t i = 0; i < argc; i++) {
-		zval *argument = ZEND_CALL_ARG(execute_data, i + 1);
+		zval *argument = gameshark_call_arg(execute_data, i);
 		Z_TRY_ADDREF_P(argument);
 		add_next_index_zval(args, argument);
 	}
@@ -2539,7 +2557,7 @@ static zval *gameshark_build_pre_hook_params(zend_execute_data *execute_data, bo
 		ZVAL_COPY(&params[offset++], &execute_data->This);
 	}
 	for (uint32_t i = 0; i < argc; i++) {
-		ZVAL_COPY(&params[offset++], ZEND_CALL_ARG(execute_data, i + 1));
+		ZVAL_COPY(&params[offset++], gameshark_call_arg(execute_data, i));
 	}
 	return params;
 }
