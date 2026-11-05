@@ -2906,14 +2906,15 @@ static void gameshark_run_catch_all_post(gameshark_catch_all_entry *entry, games
 	}
 }
 
-static void gameshark_push_invariant_frame(zend_execute_data *execute_data, bool has_object)
+static bool gameshark_push_invariant_frame(zend_execute_data *execute_data, bool has_object)
 {
 	if (gameshark_invariant_frame_count >= GAMESHARK_INVARIANT_MAX_ACTIVE_FRAMES) {
-		return;
+		return false;
 	}
 
 	gameshark_invariant_frame *frame = &gameshark_invariant_frames[gameshark_invariant_frame_count++];
 	gameshark_init_invariant_frame(frame, execute_data, has_object);
+	return true;
 }
 
 static gameshark_invariant_frame *gameshark_find_invariant_frame(zend_execute_data *execute_data, size_t *frame_index)
@@ -3346,6 +3347,7 @@ static void gameshark_execute_ex(zend_execute_data *execute_data)
 	bool generator = gameshark_invariant_user_function_supported(execute_data->func) &&
 		(execute_data->func->op_array.fn_flags & ZEND_ACC_GENERATOR) != 0;
 	bool resumed = generator && (ZEND_CALL_INFO(execute_data) & ZEND_CALL_GENERATOR) != 0;
+	bool pushed_frame = false;
 
 	if (gameshark_invariants_active && gameshark_invariants_executing_hook && gameshark_invariant_user_function_supported(execute_data->func)) {
 		gameshark_invariant_reentrancy_suppressed++;
@@ -3376,16 +3378,27 @@ static void gameshark_execute_ex(zend_execute_data *execute_data)
 			push_frame = true;
 		}
 		if (push_frame && !generator) {
-			gameshark_push_invariant_frame(execute_data, has_object);
+			pushed_frame = gameshark_push_invariant_frame(execute_data, has_object);
 		}
 	}
 
 	if (gameshark_original_execute_ex != NULL) {
 		gameshark_original_execute_ex(execute_data);
-		return;
+	} else {
+		execute_ex(execute_data);
 	}
 
-	execute_ex(execute_data);
+	/*
+	 * The observer ends a call which returns, and its post hooks remove its frame.
+	 * A call which threw runs no post hooks, so its frame is removed here: left, it
+	 * would keep its arguments alive, and be given to a later call at the same address.
+	 */
+	if (pushed_frame) {
+		size_t frame_index = 0;
+		if (gameshark_find_invariant_frame(execute_data, &frame_index) != NULL) {
+			gameshark_remove_invariant_frame(frame_index);
+		}
+	}
 }
 
 static void gameshark_call_original_execute_internal(zend_execute_data *execute_data, zval *return_value)
