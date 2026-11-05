@@ -1768,10 +1768,16 @@ static void gameshark_append_function_display(smart_str *stack, zend_function *f
  * A userland function's arguments beyond those it declares are moved past its
  * compiled variables and temporaries, as func_get_args() reads them.
  */
+/*
+ * Returns the i-th argument a call was given. A user function's arguments past
+ * those it declares are moved after its variables when it starts, but not those
+ * of a trampoline, which stands in for __call() or __callStatic() and declares
+ * none.
+ */
 static zval *gameshark_call_arg(zend_execute_data *execute_data, uint32_t i)
 {
 	zend_function *function = execute_data->func;
-	if (function != NULL && ZEND_USER_CODE(function->type)) {
+	if (function != NULL && ZEND_USER_CODE(function->type) && (function->common.fn_flags & ZEND_ACC_CALL_VIA_TRAMPOLINE) == 0) {
 		uint32_t first_extra_arg = function->op_array.num_args;
 		if (i >= first_extra_arg) {
 			return ZEND_CALL_VAR_NUM(execute_data, function->op_array.last_var + function->op_array.T + (i - first_extra_arg));
@@ -2550,12 +2556,18 @@ static void gameshark_follow_return_transforms(zend_execute_data *execute_data, 
 	}
 }
 
+/*
+ * Closures have no name to hook. A trampoline, which stands in for __call() or
+ * __callStatic() when an inaccessible method is called, is not hooked either: the
+ * engine reuses it for every such call, and its observer never ends it. The
+ * __call() or __callStatic() method it calls is hooked instead.
+ */
 static bool gameshark_invariant_function_supported(zend_function *function)
 {
 	return function != NULL &&
 		function->common.function_name != NULL &&
 		(function->type == ZEND_USER_FUNCTION || function->type == ZEND_INTERNAL_FUNCTION) &&
-		(function->common.fn_flags & ZEND_ACC_CLOSURE) == 0;
+		(function->common.fn_flags & (ZEND_ACC_CLOSURE | ZEND_ACC_CALL_VIA_TRAMPOLINE)) == 0;
 }
 
 static bool gameshark_invariant_user_function_supported(zend_function *function)
@@ -2612,14 +2624,28 @@ static void gameshark_mark_invariant_spec_matched(gameshark_invariant_spec *spec
 	}
 }
 
+/*
+ * Copies the i-th argument of a call. An optional parameter which named arguments
+ * skipped has no value until the function sets its default, and is null here.
+ */
+static void gameshark_copy_call_arg(zend_execute_data *execute_data, uint32_t i, zval *copy)
+{
+	zval *argument = gameshark_call_arg(execute_data, i);
+	if (Z_ISUNDEF_P(argument)) {
+		ZVAL_NULL(copy);
+	} else {
+		ZVAL_COPY(copy, argument);
+	}
+}
+
 static void gameshark_capture_call_args(zend_execute_data *execute_data, zval *args)
 {
 	array_init(args);
 	uint32_t argc = ZEND_CALL_NUM_ARGS(execute_data);
 	for (uint32_t i = 0; i < argc; i++) {
-		zval *argument = gameshark_call_arg(execute_data, i);
-		Z_TRY_ADDREF_P(argument);
-		add_next_index_zval(args, argument);
+		zval argument;
+		gameshark_copy_call_arg(execute_data, i, &argument);
+		add_next_index_zval(args, &argument);
 	}
 }
 
@@ -2637,7 +2663,7 @@ static zval *gameshark_build_pre_hook_params(zend_execute_data *execute_data, bo
 		ZVAL_COPY(&params[offset++], &execute_data->This);
 	}
 	for (uint32_t i = 0; i < argc; i++) {
-		ZVAL_COPY(&params[offset++], gameshark_call_arg(execute_data, i));
+		gameshark_copy_call_arg(execute_data, i, &params[offset++]);
 	}
 	return params;
 }
@@ -2880,14 +2906,15 @@ static void gameshark_run_catch_all_post(gameshark_catch_all_entry *entry, games
 	}
 }
 
-static void gameshark_push_invariant_frame(zend_execute_data *execute_data, bool has_object)
+static bool gameshark_push_invariant_frame(zend_execute_data *execute_data, bool has_object)
 {
 	if (gameshark_invariant_frame_count >= GAMESHARK_INVARIANT_MAX_ACTIVE_FRAMES) {
-		return;
+		return false;
 	}
 
 	gameshark_invariant_frame *frame = &gameshark_invariant_frames[gameshark_invariant_frame_count++];
 	gameshark_init_invariant_frame(frame, execute_data, has_object);
+	return true;
 }
 
 static gameshark_invariant_frame *gameshark_find_invariant_frame(zend_execute_data *execute_data, size_t *frame_index)
@@ -3320,6 +3347,7 @@ static void gameshark_execute_ex(zend_execute_data *execute_data)
 	bool generator = gameshark_invariant_user_function_supported(execute_data->func) &&
 		(execute_data->func->op_array.fn_flags & ZEND_ACC_GENERATOR) != 0;
 	bool resumed = generator && (ZEND_CALL_INFO(execute_data) & ZEND_CALL_GENERATOR) != 0;
+	bool pushed_frame = false;
 
 	if (gameshark_invariants_active && gameshark_invariants_executing_hook && gameshark_invariant_user_function_supported(execute_data->func)) {
 		gameshark_invariant_reentrancy_suppressed++;
@@ -3350,16 +3378,27 @@ static void gameshark_execute_ex(zend_execute_data *execute_data)
 			push_frame = true;
 		}
 		if (push_frame && !generator) {
-			gameshark_push_invariant_frame(execute_data, has_object);
+			pushed_frame = gameshark_push_invariant_frame(execute_data, has_object);
 		}
 	}
 
 	if (gameshark_original_execute_ex != NULL) {
 		gameshark_original_execute_ex(execute_data);
-		return;
+	} else {
+		execute_ex(execute_data);
 	}
 
-	execute_ex(execute_data);
+	/*
+	 * The observer ends a call which returns, and its post hooks remove its frame.
+	 * A call which threw runs no post hooks, so its frame is removed here: left, it
+	 * would keep its arguments alive, and be given to a later call at the same address.
+	 */
+	if (pushed_frame) {
+		size_t frame_index = 0;
+		if (gameshark_find_invariant_frame(execute_data, &frame_index) != NULL) {
+			gameshark_remove_invariant_frame(frame_index);
+		}
+	}
 }
 
 static void gameshark_call_original_execute_internal(zend_execute_data *execute_data, zval *return_value)

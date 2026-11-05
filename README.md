@@ -163,7 +163,7 @@ php -d extension=gameshark.so \
   script.php
 ```
 
-The file returns a list of specs. Each has an `id`, a `target`, `when` (`pre` or `post`) and a `hook`. A target is a function, such as `get_post`, or a method, as `Class::method` with the class which declares it. A `pre` hook gets the object of an instance method, then the arguments; a `post` hook gets the object, the return value, then the arguments as an array. Calls made from inside hooks are not hooked. A generator's hooks run once, when it is called, and not each time it is resumed; it gets no `post` hooks, since the observer would end it at every `yield`.
+The file returns a list of specs. Each has an `id`, a `target`, `when` (`pre` or `post`) and a `hook`. A target is a function, such as `get_post`, or a method, as `Class::method` with the class which declares it. A `pre` hook gets the object of an instance method, then the arguments; a `post` hook gets the object, the return value, then the arguments as an array. Calls made from inside hooks are not hooked. A call to an inaccessible or undefined method, which PHP routes through a trampoline to `__call()` or `__callStatic()`, is hooked as that method. A generator's hooks run once, when it is called, and not each time it is resumed; it gets no `post` hooks, since the observer would end it at every `yield`.
 
 The target `*` traps every named user-space function and method, but not closures or built-in functions. Its hooks get the function as `name` or `Class::name`, which the hook would otherwise have to look up:
 
