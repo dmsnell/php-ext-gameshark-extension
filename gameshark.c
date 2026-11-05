@@ -3312,9 +3312,18 @@ static zend_observer_fcall_handlers gameshark_observer_fcall_init(zend_execute_d
 
 static void gameshark_execute_ex(zend_execute_data *execute_data)
 {
+	/*
+	 * A generator runs here once for its call, which returns the Generator, then
+	 * again each time it is resumed. Its hooks run once, for the call, and it gets
+	 * no post hooks: the observer would end it at every yield, with what it yields.
+	 */
+	bool generator = gameshark_invariant_user_function_supported(execute_data->func) &&
+		(execute_data->func->op_array.fn_flags & ZEND_ACC_GENERATOR) != 0;
+	bool resumed = generator && (ZEND_CALL_INFO(execute_data) & ZEND_CALL_GENERATOR) != 0;
+
 	if (gameshark_invariants_active && gameshark_invariants_executing_hook && gameshark_invariant_user_function_supported(execute_data->func)) {
 		gameshark_invariant_reentrancy_suppressed++;
-	} else if (gameshark_invariants_active && gameshark_invariant_user_function_supported(execute_data->func)) {
+	} else if (gameshark_invariants_active && !resumed && gameshark_invariant_user_function_supported(execute_data->func)) {
 		uint8_t target_kind;
 		bool push_frame = false;
 		bool has_object = execute_data->func->common.scope != NULL && Z_TYPE(execute_data->This) == IS_OBJECT;
@@ -3340,7 +3349,7 @@ static void gameshark_execute_ex(zend_execute_data *execute_data)
 		if (entry != NULL && entry->post_mask != 0) {
 			push_frame = true;
 		}
-		if (push_frame) {
+		if (push_frame && !generator) {
 			gameshark_push_invariant_frame(execute_data, has_object);
 		}
 	}
